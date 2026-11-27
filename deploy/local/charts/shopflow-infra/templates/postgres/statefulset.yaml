@@ -1,0 +1,115 @@
+{{- if .Values.postgres.enabled }}
+{{- $ctx := dict "root" . "name" "postgres" "component" "database" -}}
+{{- $pg := .Values.postgres -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $pg.serviceName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" $ctx | nindent 4 }}
+spec:
+  serviceName: {{ $pg.serviceName }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "shopflow-infra.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/postgres/secret.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/postgres/configmap.yaml") . | sha256sum }}
+        {{- with $pg.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "shopflow-infra.labels" $ctx | nindent 8 }}
+        {{- with $pg.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ $pg.uid }}
+        runAsGroup: {{ $pg.uid }}
+        fsGroup: {{ $pg.uid }}
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ include "shopflow-infra.postgres.image" . }}
+          imagePullPolicy: {{ $pg.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            # Subdirectory: the volume root may contain lost+found, which initdb refuses.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pg.serviceName }}-auth
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pg.serviceName }}-auth
+                  key: password
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\""]
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\""]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\""]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            # Writable paths under readOnlyRootFilesystem: unix socket dir and scratch space.
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: {{ $pg.serviceName }}-init
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $pg.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $pg.persistence.size }}
+{{- end }}

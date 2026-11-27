@@ -1,0 +1,37 @@
+{{- if and .Values.kafka.enabled .Values.kafka.metrics.enabled }}
+{{- $k := .Values.kafka -}}
+# Kafka is outside the mesh, so envoy-stats doesn't cover it: scrape the broker (Strimzi
+# Metrics Reporter) and the Kafka Exporter directly. Both name their port tcp-prometheus.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ $k.name }}-kafka
+  namespace: {{ $k.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "kafka" "component" "metrics") | nindent 4 }}
+spec:
+  selector:
+    matchExpressions:
+      - key: strimzi.io/cluster
+        operator: In
+        values: [{{ $k.name }}]
+      - key: strimzi.io/kind
+        operator: In
+        values: [Kafka]
+      - key: strimzi.io/name
+        operator: In
+        values: [{{ $k.name }}-kafka, {{ $k.name }}-kafka-exporter]
+  podMetricsEndpoints:
+    - port: tcp-prometheus
+      path: /metrics
+      interval: {{ $k.metrics.interval }}
+      relabelings:
+        # kafka | kafka-exporter, for dashboards and alert selectors.
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_strimzi_io_name]
+          regex: {{ $k.name }}-(.*)
+          targetLabel: app
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+{{- end }}

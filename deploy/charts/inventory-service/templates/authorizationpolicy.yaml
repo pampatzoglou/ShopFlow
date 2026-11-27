@@ -1,0 +1,30 @@
+{{- /* Istio L7 allow-list for the service pods: once an ALLOW policy selects a workload, every
+       request no rule matches gets 403. Callers are matched by mTLS identity (service
+       account principal), so this needs the caller's sidecar. Rules go through tpl. */ -}}
+{{- if .Values.authorizationPolicy.enabled }}
+{{- $component := dict "root" . "component" "server" }}
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "inventory-service.fullname" . }}
+  labels:
+    {{- include "inventory-service.componentLabels" $component | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "inventory-service.componentSelectorLabels" $component | nindent 6 }}
+  action: ALLOW
+  rules:
+    {{- with .Values.authorizationPolicy.rules }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+    # The chart's own `helm test` pod (default service account): GET /health only.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/{{ .Release.Namespace }}/sa/default
+      to:
+        - operation:
+            methods: [GET]
+            paths: [/health]
+{{- end }}

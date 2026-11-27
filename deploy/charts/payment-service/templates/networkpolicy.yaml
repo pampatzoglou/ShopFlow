@@ -1,0 +1,40 @@
+{{- /* Ingress/egress allow-list for the service pods: anything not listed is dropped once a
+       direction has rules (policyTypes is derived from which lists are non-empty). Rules go
+       through tpl, so they can reference values. */ -}}
+{{- if .Values.networkPolicy.enabled }}
+{{- $component := dict "root" . "component" "server" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "payment-service.fullname" . }}
+  labels:
+    {{- include "payment-service.componentLabels" $component | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "payment-service.componentSelectorLabels" $component | nindent 6 }}
+  {{- if or .Values.networkPolicy.ingress .Values.networkPolicy.egress }}
+  policyTypes:
+    {{- if .Values.networkPolicy.ingress }}
+    - Ingress
+    {{- end }}
+    {{- if .Values.networkPolicy.egress }}
+    - Egress
+    {{- end }}
+  {{- end }}
+  {{- with .Values.networkPolicy.ingress }}
+  ingress:
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    # The chart's own `helm test` pod (templates/tests/), which calls the http port.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "payment-service.componentSelectorLabels" (dict "root" $ "component" "test") | nindent 14 }}
+      ports:
+        - port: http
+  {{- end }}
+  {{- with .Values.networkPolicy.egress }}
+  egress:
+    {{- tpl (toYaml .) $ | nindent 4 }}
+  {{- end }}
+{{- end }}

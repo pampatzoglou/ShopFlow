@@ -1,0 +1,23 @@
+{{- if and .Values.stackGrafana.enabled (index .Values "grafana-operator").enabled }}
+{{- $s := .Values.stackGrafana -}}
+# The kube-prometheus-stack Grafana, registered as an external (not operator-deployed)
+# instance: one Grafana keeps the stack's bundled dashboards, and the operator can still push
+# CR-declared content to it.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: Grafana
+metadata:
+  name: {{ $s.name }}
+  namespace: {{ $s.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "grafana" "component" "monitoring") | nindent 4 }}
+    {{- toYaml $s.labels | nindent 4 }}
+spec:
+  external:
+    url: {{ $s.url }}
+    adminUser:
+      name: {{ $s.adminSecret.name }}
+      key: {{ $s.adminSecret.userKey }}
+    adminPassword:
+      name: {{ $s.adminSecret.name }}
+      key: {{ $s.adminSecret.passwordKey }}
+{{- end }}

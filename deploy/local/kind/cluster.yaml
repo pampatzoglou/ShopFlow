@@ -1,0 +1,30 @@
+# Local kind cluster for ShopFlow. Created by `task cluster:create` (part of `task cluster:up`).
+#
+# Networking: kindnet stays the primary CNI (pod IPs, routes). Istio's CNI plugin is
+# installed on top as a *chained* plugin — it only sets up the sidecar traffic redirect,
+# replacing the privileged istio-init container. It cannot act as the primary CNI.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: shopflow
+# Fixed API server port (kind's default is random), so the devcontainer can forward it to the
+# host for host-side tools (OpenLens) using .kube/kind-shopflow.yaml (`task cluster:kubeconfig`).
+# Not 6443: Docker Desktop's own Kubernetes uses it. Takes effect on cluster creation.
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6444
+nodes:
+  - role: control-plane
+    # v1.34: inside Istio 1.29's supported range and kubectl@1.34's skew (devbox.json).
+    # kind 0.33's built-in default (v1.37) is newer than Istio 1.29 supports.
+    image: kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d
+    # Istio ingress gateway NodePorts (deploy/local/istio/istio.yaml) exposed on localhost,
+    # so the e2e default GATEWAY_URL=http://localhost:30080 works without a port-forward.
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30443
+        hostPort: 30443
+        listenAddress: "127.0.0.1"
+        protocol: TCP

@@ -1,0 +1,31 @@
+# -- Local kind inner loop only: layered last by skaffold.yaml, over values.yaml ->
+# -- defaults/values.yaml. Never used by ArgoCD (dev/ and prod/ are the cluster envs).
+# -- Skaffold builds the Dockerfile `develop` stage, which differs from `production`:
+# -- it runs as root (files are root-owned), writes into /app at runtime, and file sync
+# -- (kubectl exec + tar) needs a writable rootfs. Relax only what that requires.
+
+podSecurityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+
+securityContext:
+  readOnlyRootFilesystem: false
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+
+# -- `gradlew bootRun` runs two JVMs (Gradle + the app) in one container.
+env:
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=35.0"
+
+resources:
+  limits:
+    memory: 1536Mi
+  requests:
+    memory: 1Gi
+
+# -- Gradle startup + bootRun is much slower than the production jar.
+startupProbe:
+  failureThreshold: 60

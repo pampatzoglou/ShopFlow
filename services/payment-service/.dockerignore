@@ -1,0 +1,27 @@
+# Build context: this directory. Patterns match from the context root only; **/ makes them
+# match at any depth (git's .gitignore does that implicitly, .dockerignore does not).
+
+# VCS and ignore files, at any depth
+.git
+**/.gitignore
+.dockerignore
+Dockerfile
+
+# Editor / OS
+**/.DS_Store
+.idea
+.vscode
+**/*.swp
+
+# Local secrets
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+
+# Generated — the build stage reinstalls and recompiles
+node_modules
+dist
+coverage
+
+*.md

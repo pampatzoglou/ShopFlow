@@ -1,0 +1,10 @@
+# -- prod cluster (ArgoCD, deploy/argo/applicationset.yaml). The digest is not set here: the
+# -- ApplicationSet passes it as the `image.digest` parameter, together with the pinned chart
+# -- commit, both written by `task promote:prod`. The tag is informational; pulls are by digest.
+image:
+  repository: ghcr.io/pampatzoglou/shopflow/order-service
+  tag: main
+  # -- Injected by the ApplicationSet. Rendering fails while empty (requireDigest).
+  digest: ""
+  requireDigest: true
+  pullPolicy: Always

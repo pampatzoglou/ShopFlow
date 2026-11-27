@@ -1,0 +1,30 @@
+{{- $ui := .Values.kafkaUi -}}
+{{- if and .Values.gateway.enabled $ui.enabled }}
+{{- $prefix := $ui.contextPath | trimSuffix "/" -}}
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: kafka-ui
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "kafka-ui" "component" "ingress") | nindent 4 }}
+spec:
+  hosts:
+    {{- toYaml .Values.gateway.hosts | nindent 4 }}
+  gateways:
+    - {{ .Values.gateway.name }}
+  http:
+    - name: kafka-ui
+      # No rewrite: the UI is served under its context path ({{ $prefix }}), so its asset
+      # and API URLs already carry the prefix.
+      match:
+        - uri:
+            prefix: {{ $prefix }}/
+        - uri:
+            exact: {{ $prefix }}
+      route:
+        - destination:
+            host: {{ $ui.name }}.{{ .Values.namespace }}.svc.cluster.local
+            port:
+              number: 80
+{{- end }}

@@ -1,0 +1,58 @@
+{{- if .Values.grafana.enabled }}
+{{- $g := .Values.grafana -}}
+# Operator-managed Grafana for the ShopFlow team. The operator generates the admin login
+# into the Secret <name>-admin-credentials (keys GF_SECURITY_ADMIN_USER/PASSWORD).
+apiVersion: grafana.integreatly.org/v1beta1
+kind: Grafana
+metadata:
+  name: {{ $g.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "grafana" "component" "dashboards") | nindent 4 }}
+    {{- toYaml $g.instanceLabels | nindent 4 }}
+spec:
+  version: {{ $g.version | quote }}
+  config:
+    log:
+      mode: console
+    server:
+      # Behind the gateway at {{ $g.route.prefix }}/ with the prefix stripped: Grafana serves
+      # from / (where the operator also reaches its API) but builds links under the prefix.
+      root_url: {{ $g.rootUrl | quote }}
+    analytics:
+      reporting_enabled: "false"
+      check_for_updates: "false"
+      check_for_plugin_updates: "false"
+    {{- if $g.anonymousAdmin }}
+    # Local development: everyone is an anonymous Admin, no login form. Basic auth stays on:
+    # the operator reconciles through the API with the generated admin credentials.
+    auth:
+      disable_login_form: "true"
+    auth.anonymous:
+      enabled: "true"
+      org_name: Main Org.
+      org_role: Admin
+    {{- end }}
+  deployment:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: grafana
+              resources:
+                {{- toYaml $g.resources | nindent 16 }}
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaFolder
+metadata:
+  name: {{ $g.name }}-shopflow
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "grafana" "component" "dashboards") | nindent 4 }}
+spec:
+  title: {{ $g.dashboards.folder }}
+  resyncPeriod: {{ $g.resyncPeriod }}
+  instanceSelector:
+    matchLabels:
+      {{- toYaml $g.instanceLabels | nindent 6 }}
+{{- end }}

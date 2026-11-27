@@ -1,0 +1,611 @@
+version: "3"
+
+vars:
+  CLUSTER: shopflow
+  CONTEXT: kind-{{.CLUSTER}}
+  NAMESPACE: shopflow
+  LOCAL_DIR: deploy/local
+  CHARTS_DIR: deploy/charts
+  OUTPUT_DIR: .argo
+  LOCAL_CHARTS_DIR: deploy/local/charts
+  KUBESCAPE_FRAMEWORK: nsa
+  KUBESCAPE_FAIL_THRESHOLD: high
+  REGISTRY: ghcr.io/pampatzoglou/shopflow
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  # Each step is idempotent, so `task cluster:up` also converges an existing cluster.
+  # Order matters: Istio must be running before shopflow-infra creates any pod, or those
+  # pods get no sidecar; everything else (monitoring, Strimzi, Kafka, PostgreSQL, Grafana) is
+  # the one shopflow-infra release.
+  cluster:up:
+    desc: Create the kind cluster and install Istio, the shopflow-infra umbrella and dashboards
+    aliases: [setup]
+    cmds:
+      - task: cluster:create
+      - task: cluster:kubeconfig
+      - task: cluster:istio
+      - task: cluster:infra
+      - task: cluster:dashboards
+      - task: _cluster_summary
+
+  # Closing summary of endpoints and next steps. The umbrella's NOTES
+  # carry the same endpoints but scroll past in the Helm output.
+  _cluster_summary:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        cat <<EOF
+
+        Cluster '{{.CLUSTER}}' is ready (context {{.CONTEXT}}).
+
+          Ingress gateway  http://localhost:30080
+          Grafana          http://localhost:30080/grafana   (no login)
+          Kafka UI         http://localhost:30080/kafka
+          PostgreSQL       postgres.{{.NAMESPACE}}.svc.cluster.local:5432
+          Kafka            shopflow-kafka-bootstrap.{{.NAMESPACE}}.svc.cluster.local:9092
+
+          Next:  task run      deploy the services (skaffold)
+                 task test     E2E suite + k6 load test
+                 task status   workloads, releases, routes, warnings
+        EOF
+
+  cluster:create:
+    desc: Create the kind cluster (skipped if it already exists)
+    status:
+      - kind get clusters 2>/dev/null | grep -qx '{{.CLUSTER}}'
+    cmds:
+      - kind create cluster --name {{.CLUSTER}} --config {{.LOCAL_DIR}}/kind/cluster.yaml --wait 120s
+
+  # For tools outside the devcontainer (OpenLens on the host): the workspace is bind-mounted,
+  # so the host sees this file; the devcontainer forwards the API server port (6444). Holds
+  # cluster-admin client credentials: gitignored, mode 600. Rewritten on every cluster:up,
+  # since a recreated cluster has new certificates.
+  cluster:kubeconfig:
+    desc: Write the kind cluster's kubeconfig to .kube/{{.CONTEXT}}.yaml (for OpenLens on the host)
+    preconditions:
+      - sh: kind get clusters 2>/dev/null | grep -qx '{{.CLUSTER}}'
+        msg: "kind cluster '{{.CLUSTER}}' not found — run `task cluster:up` first"
+    cmds:
+      - mkdir -p .kube
+      # No umask: Task's shell (mvdan/sh) lacks it. Create the file 600 before kind writes the
+      # credentials into it, and re-assert after in case it already existed with a wider mode.
+      - '[ -f .kube/{{.CONTEXT}}.yaml ] || install -m 600 /dev/null .kube/{{.CONTEXT}}.yaml'
+      - kind export kubeconfig --name {{.CLUSTER}} --kubeconfig .kube/{{.CONTEXT}}.yaml
+      - chmod 600 .kube/{{.CONTEXT}}.yaml
+      # The host reaches the API server only on the forwarded port; a cluster created before
+      # cluster.yaml fixed it has a random one, and nothing on the host serves that.
+      - |
+        want=$(yq '.networking.apiServerPort' {{.LOCAL_DIR}}/kind/cluster.yaml)
+        server=$(kubectl config view --kubeconfig .kube/{{.CONTEXT}}.yaml -o jsonpath='{.clusters[0].cluster.server}')
+        if [ "$server" != "https://127.0.0.1:$want" ]; then
+          echo "✗ cluster API server is $server, not port $want (created before the port was fixed)." >&2
+          echo "  Recreate it: task cluster:reset" >&2
+          exit 1
+        fi
+      - 'echo "kubeconfig: .kube/{{.CONTEXT}}.yaml (in the repo; add it to OpenLens from the host)"'
+
+  cluster:istio:
+    desc: Install Istio (sidecar mode + CNI plugin)
+    preconditions:
+      # Guard for every task that talks to a cluster: only ever the local kind cluster.
+      # CONTEXT can be overridden on the command line, so pin it to kind-<CLUSTER>, require
+      # the kind cluster to exist, and require the context's API server to be on localhost
+      # (where kind serves it), which a platform cluster's context can't pass even if renamed.
+      - &cluster_exists
+        sh: kind get clusters 2>/dev/null | grep -qx '{{.CLUSTER}}'
+        msg: "kind cluster '{{.CLUSTER}}' not found — run `task cluster:up` first"
+      - &kind_context
+        sh: |
+          [ "{{.CONTEXT}}" = "kind-{{.CLUSTER}}" ] || exit 1
+          server=$(kubectl config view -o jsonpath='{.clusters[?(@.name=="{{.CONTEXT}}")].cluster.server}')
+          case "$server" in https://127.0.0.1:*|https://localhost:*) ;; *) exit 1 ;; esac
+        msg: >-
+          refusing to run: CONTEXT must be the local kind context 'kind-{{.CLUSTER}}' with an
+          API server on localhost (got CONTEXT='{{.CONTEXT}}')
+    cmds:
+      - istioctl install --context {{.CONTEXT}} -f {{.LOCAL_DIR}}/istio/istio.yaml -y
+      - kubectl --context {{.CONTEXT}} -n istio-system rollout status daemonset/istio-cni-node --timeout=120s
+
+  # Release namespace kafka-system: the Strimzi subchart can only install into it. The other
+  # components set their own namespaces (see the chart's values.yaml).
+  cluster:infra:
+    desc: Install the shopflow-infra umbrella (monitoring, Strimzi + Kafka, PostgreSQL, Grafana, UI)
+    cmds:
+      - task: _helm_install
+        vars: { CHART: shopflow-infra, RELEASE_NAMESPACE: kafka-system }
+      - kubectl --context {{.CONTEXT}} -n {{.NAMESPACE}} rollout status statefulset/postgres --timeout=180s
+      # Strimzi creates the broker pods asynchronously after the Kafka CR is applied.
+      - kubectl --context {{.CONTEXT}} -n {{.NAMESPACE}} wait kafka/shopflow --for=condition=Ready --timeout=600s
+
+  # GrafanaDashboard CRs, reconciled into the ShopFlow Grafana (instance, folder and
+  # datasources come from shopflow-infra, so this runs after cluster:infra). Deleting a file
+  # doesn't delete its dashboard: `kubectl -n shopflow delete grafanadashboard <name>`.
+  cluster:dashboards:
+    desc: Apply the Grafana dashboards in deploy/dashboards/
+    preconditions:
+      - *cluster_exists
+      - *kind_context
+    cmds:
+      - kubectl --context {{.CONTEXT}} apply -f deploy/dashboards/
+
+  cluster:down:
+    desc: Delete the kind cluster and everything in it
+    prompt: Delete kind cluster '{{.CLUSTER}}' and all its data?
+    cmds:
+      - kind delete cluster --name {{.CLUSTER}}
+      - rm -f .kube/{{.CONTEXT}}.yaml
+
+  # Everything `task deploy` left behind, for a fresh `task deploy`. Scoped to this project's
+  # names (cluster, context, images), so other kind clusters and images are untouched. Kept:
+  # the kindest/node and base images (download cache, not state) and the registered Helm repos.
+  destroy:
+    desc: Delete the kind cluster, stop its port-forwards, remove built images and generated files
+    prompt: >-
+      Delete kind cluster '{{.CLUSTER}}' with all its data, stop its port-forwards and skaffold
+      sessions, and remove the locally built service images?
+    vars:
+      IMAGES: order-service payment-service inventory-service
+    cmds:
+      # Port-forwards and skaffold sessions against this cluster hold local ports (skaffold dev
+      # forwards 8081-8083) and would only error once the cluster is gone.
+      - cmd: pkill -f 'kubectl.*--context {{.CONTEXT}} .*port-forward' && echo "stopped port-forwards" || true
+        silent: true
+      - cmd: pkill -f 'skaffold (dev|run|debug) .*--kube-context {{.CONTEXT}}' && echo "stopped skaffold" || true
+        silent: true
+      # Frees the ingress NodePorts (30080, 30443) and the API server port, and removes the
+      # kind-<cluster> kubeconfig context (and its host-side export).
+      - kind delete cluster --name {{.CLUSTER}}
+      - rm -f .kube/{{.CONTEXT}}.yaml
+      # task build (:latest), skaffold (content-hash tags) and task publish (registry) images.
+      - cmd: |
+          ids=$(docker images -q {{range $i := splitList " " .IMAGES}}--filter reference={{$i}} --filter 'reference={{$.REGISTRY}}/{{$i}}' {{end}} | sort -u)
+          if [ -n "$ids" ]; then docker rmi -f $ids >/dev/null && echo "removed $(echo "$ids" | wc -l | tr -d ' ') service images"; else echo "no service images"; fi
+        silent: true
+      - task: clean
+      # Explicit ifs, not `lsof && busy=...`: Task's shell (mvdan/sh) ends the script when a
+      # loop's last command fails, and lsof fails exactly when the port is free.
+      - cmd: |
+          busy=""
+          for p in 30080 30443; do
+            if lsof -nP -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1; then
+              busy="$busy $p"
+            fi
+          done
+          if [ -n "$busy" ]; then
+            echo "still in use:$busy (another process holds them)"
+            exit 1
+          fi
+          echo "ports 30080 and 30443 are free; run 'task deploy' for a fresh setup"
+        silent: true
+
+  cluster:reset:
+    desc: Recreate the kind cluster from scratch
+    cmds:
+      - task: cluster:down
+      - task: cluster:up
+
+  # Release name = chart name; charts live in LOCAL_CHARTS_DIR.
+  _helm_install:
+    internal: true
+    requires:
+      vars: [CHART, RELEASE_NAMESPACE]
+    preconditions:
+      - *cluster_exists
+      - *kind_context
+    cmds:
+      - task: _helm_repos
+      - helm dependency build {{.LOCAL_CHARTS_DIR}}/{{.CHART}}
+      # --wait=watcher (Helm 4): block until every resource is ready, workloads and custom
+      # resources with a Ready condition (Kafka, Grafana) alike. Without --wait, Helm 4 only
+      # waits for hooks.
+      - >-
+        helm upgrade --install {{.CHART}} {{.LOCAL_CHARTS_DIR}}/{{.CHART}}
+        --kube-context {{.CONTEXT}} --namespace {{.RELEASE_NAMESPACE}} --create-namespace
+        --wait=watcher --timeout 10m
+
+  build:
+    desc: Build all service images
+    deps:
+      - build:order-service
+      - build:payment-service
+      - build:inventory-service
+
+  build:order-service:
+    desc: Build the order-service image
+    cmds:
+      - task: _build
+        vars: { SERVICE: order-service }
+
+  build:payment-service:
+    desc: Build the payment-service image
+    cmds:
+      - task: _build
+        vars: { SERVICE: payment-service }
+
+  build:inventory-service:
+    desc: Build the inventory-service image
+    cmds:
+      - task: _build
+        vars: { SERVICE: inventory-service }
+
+  _build:
+    internal: true
+    requires:
+      vars: [SERVICE]
+    vars:
+      TAG: '{{.TAG | default "latest"}}'
+    cmds:
+      - docker build -t {{.SERVICE}}:{{.TAG}} ./services/{{.SERVICE}}
+
+  # Publishing is CI's job (.github/workflows/release.yaml, on push to main): `:main` is what
+  # the dev clusters pull, `:sha-<commit>` is what `promote:prod` pins by digest.
+  publish:
+    desc: Build and push all service images to REGISTRY (:main and :sha-<commit>)
+    deps:
+      - publish:order-service
+      - publish:payment-service
+      - publish:inventory-service
+
+  publish:order-service:
+    desc: Build and push the order-service image
+    cmds:
+      - task: _publish
+        vars: { SERVICE: order-service }
+
+  publish:payment-service:
+    desc: Build and push the payment-service image
+    cmds:
+      - task: _publish
+        vars: { SERVICE: payment-service }
+
+  publish:inventory-service:
+    desc: Build and push the inventory-service image
+    cmds:
+      - task: _publish
+        vars: { SERVICE: inventory-service }
+
+  _publish:
+    internal: true
+    requires:
+      vars: [SERVICE]
+    vars:
+      REVISION:
+        sh: git rev-parse HEAD
+    preconditions:
+      # The sha tag must name exactly what was built; a dirty tree would make it lie.
+      - sh: test -z "$(git status --porcelain -- ./services/{{.SERVICE}})"
+        msg: "services/{{.SERVICE}} has uncommitted or untracked changes; commit before publishing"
+    cmds:
+      - >-
+        docker buildx build ./services/{{.SERVICE}}
+        --target production
+        --tag {{.REGISTRY}}/{{.SERVICE}}:main
+        --tag {{.REGISTRY}}/{{.SERVICE}}:sha-{{.REVISION}}
+        --label org.opencontainers.image.source=https://github.com/pampatzoglou/ShopFlow
+        --label org.opencontainers.image.revision={{.REVISION}}
+        --push
+
+  promote:prod:
+    desc: "Pin prod to REVISION (default HEAD): chart commit + digests of images built from it"
+    vars:
+      REVISION: '{{.REVISION | default "" }}'
+      RESOLVED:
+        sh: git rev-parse {{if .REVISION}}{{.REVISION}}{{else}}HEAD{{end}}
+    cmds:
+      - REVISION={{.RESOLVED}} REGISTRY={{.REGISTRY}} ./scripts/promote-prod.sh
+
+  ci:changed-services:
+    desc: "Print the services changed between BASE and HEAD as a JSON array (CI matrix input)"
+    silent: true
+    cmds:
+      - ./scripts/changed-services.sh {{.BASE}}
+
+  # `helm dependency build` resolves non-OCI dependencies only through locally registered
+  # repos, so register every https repository named in the local charts' Chart.yaml.
+  # Repo names are derived from the URL; Helm matches dependencies by URL, not name.
+  _helm_repos:
+    internal: true
+    run: once
+    silent: true
+    cmds:
+      - |
+        set -e
+        yq '(.dependencies // [])[].repository' {{.LOCAL_CHARTS_DIR}}/*/Chart.yaml \
+          | grep -E '^https?://' | sort -u \
+          | while read -r url; do
+              name=$(printf '%s' "$url" | sed -E 's#^https?://##; s#[^A-Za-z0-9]+#-#g; s#-+$##')
+              helm repo add --force-update "$name" "$url" >/dev/null
+              echo "helm repo: $name -> $url"
+            done
+
+  deps:
+    desc: Fetch local third-party chart dependencies pinned in Chart.lock
+    cmds:
+      - task: _helm_repos
+      - for: { var: LOCAL_CHARTS, split: "\n" }
+        cmd: helm dependency build {{.ITEM}}
+    vars:
+      LOCAL_CHARTS:
+        sh: find {{.LOCAL_CHARTS_DIR}} -mindepth 2 -maxdepth 2 -name Chart.yaml -exec dirname {} \; | sort
+
+  deps:update:
+    desc: Re-resolve local chart dependencies and rewrite Chart.lock
+    cmds:
+      - task: _helm_repos
+      - for: { var: LOCAL_CHARTS, split: "\n" }
+        cmd: helm dependency update {{.ITEM}}
+    vars:
+      LOCAL_CHARTS:
+        sh: find {{.LOCAL_CHARTS_DIR}} -mindepth 2 -maxdepth 2 -name Chart.yaml -exec dirname {} \; | sort
+
+  lint:
+    desc: Lint all services (hadolint, helm lint, kubescape), dashboards and CI tool-version parity
+    deps:
+      - ci:versions
+      - lint:dashboards
+      - lint:order-service
+      - lint:payment-service
+      - lint:inventory-service
+
+  lint:dashboards:
+    desc: Check every deploy/dashboards file is a GrafanaDashboard with valid dashboard JSON
+    silent: true
+    cmds:
+      - for: { var: DASHBOARDS, split: "\n" }
+        cmd: |
+          set -e
+          [ "$(yq '.kind' {{.ITEM}})" = "GrafanaDashboard" ] || { echo "{{.ITEM}}: not a GrafanaDashboard" >&2; exit 1; }
+          uid=$(yq '.spec.json' {{.ITEM}} | jq -er '.uid')
+          [ "$uid" = "$(yq '.metadata.name' {{.ITEM}})" ] || { echo "{{.ITEM}}: dashboard uid '$uid' != metadata.name" >&2; exit 1; }
+          echo "✓ {{.ITEM}}"
+    vars:
+      DASHBOARDS:
+        sh: find deploy/dashboards -name '*.yaml' | sort
+
+  lint:order-service:
+    desc: Lint order-service (hadolint, helm lint, kubescape)
+    cmds:
+      - task: _lint
+        vars: { SERVICE: order-service }
+
+  lint:payment-service:
+    desc: Lint payment-service (hadolint, helm lint, kubescape)
+    cmds:
+      - task: _lint
+        vars: { SERVICE: payment-service }
+
+  lint:inventory-service:
+    desc: Lint inventory-service (hadolint, helm lint, kubescape)
+    cmds:
+      - task: _lint
+        vars: { SERVICE: inventory-service }
+
+  _lint:
+    internal: true
+    requires:
+      vars: [SERVICE]
+    cmds:
+      - hadolint ./services/{{.SERVICE}}/Dockerfile
+      - task: _helm
+        vars: { SERVICE: "{{.SERVICE}}", MODE: lint }
+      # kubescape scans rendered manifests, so render first.
+      - task: _template
+        vars: { SERVICE: "{{.SERVICE}}" }
+      - |
+        kubescape scan framework {{.KUBESCAPE_FRAMEWORK}} {{.OUTPUT_DIR}}/{{.SERVICE}} \
+          --severity-threshold {{.KUBESCAPE_FAIL_THRESHOLD}} \
+          $([ -f .kubescape/exceptions.json ] && echo "--exceptions .kubescape/exceptions.json")
+
+  template:
+    desc: Render all service Helm charts into .argo/
+    deps:
+      - template:order-service
+      - template:payment-service
+      - template:inventory-service
+
+  template:order-service:
+    desc: Render the order-service Helm chart into .argo/order-service
+    cmds:
+      - task: _template
+        vars: { SERVICE: order-service }
+
+  template:payment-service:
+    desc: Render the payment-service Helm chart into .argo/payment-service
+    cmds:
+      - task: _template
+        vars: { SERVICE: payment-service }
+
+  template:inventory-service:
+    desc: Render the inventory-service Helm chart into .argo/inventory-service
+    cmds:
+      - task: _template
+        vars: { SERVICE: inventory-service }
+
+  _template:
+    internal: true
+    requires:
+      vars: [SERVICE]
+    cmds:
+      - rm -rf {{.OUTPUT_DIR}}/{{.SERVICE}}
+      - mkdir -p {{.OUTPUT_DIR}}
+      - task: _helm
+        vars: { SERVICE: "{{.SERVICE}}", MODE: template }
+
+  # Shared helm invocation so lint and template always use the same values layering:
+  #   values.yaml -> defaults/values.yaml
+  # Overlays (<chart>/dev|prod/values.yaml for ArgoCD, <chart>/local/values.yaml for skaffold)
+  # are deliberately left out: lint and kubescape gate the shared baseline, and
+  # environment-specific posture is left to in-cluster kubescape (TODO.md).
+  _helm:
+    internal: true
+    silent: true
+    requires:
+      vars: [SERVICE, MODE]
+    vars:
+      CHART_PATH: "{{.CHARTS_DIR}}/{{.SERVICE}}"
+    cmds:
+      - |
+        set -e
+        [ -f "{{.CHART_PATH}}/Chart.yaml" ] || { echo "No Chart.yaml in {{.CHART_PATH}}" >&2; exit 1; }
+        VALUES_ARGS=""
+        for f in "{{.CHART_PATH}}/values.yaml" "{{.CHART_PATH}}/defaults/values.yaml"; do
+          [ -f "$f" ] && VALUES_ARGS="$VALUES_ARGS -f $f"
+        done
+        if [ "{{.MODE}}" = "lint" ]; then
+          helm lint --strict "{{.CHART_PATH}}" $VALUES_ARGS
+        else
+          helm template {{.SERVICE}} "{{.CHART_PATH}}" $VALUES_ARGS \
+            --namespace {{.NAMESPACE}} \
+            --output-dir {{.OUTPUT_DIR}}
+        fi
+
+  # Skaffold builds the images, sideloads them into kind (it detects the kind-* context;
+  # push: false) and deploys the service charts — see skaffold.yaml.
+  run:
+    desc: "Build and deploy the services to kind via skaffold, once (all, or MODULE=<service>)"
+    preconditions:
+      - *cluster_exists
+      - *kind_context
+    # One-shot, possibly unattended (`task deploy`, CI): no prompts, no update check.
+    env:
+      SKAFFOLD_INTERACTIVE: "false"
+      SKAFFOLD_UPDATE_CHECK: "false"
+    cmds:
+      - skaffold run --kube-context {{.CONTEXT}} {{if .MODULE}}-m {{.MODULE}}{{end}}
+
+  dev:
+    desc: "Skaffold inner loop on kind (all services, or MODULE=<service>)"
+    preconditions:
+      - *cluster_exists
+      - *kind_context
+    cmds:
+      - skaffold dev --kube-context {{.CONTEXT}} {{if .MODULE}}-m {{.MODULE}}{{end}}
+
+  undeploy:
+    desc: "Remove the skaffold-deployed services from kind (all, or MODULE=<service>)"
+    preconditions:
+      - *cluster_exists
+      - *kind_context
+    cmds:
+      - skaffold delete --kube-context {{.CONTEXT}} {{if .MODULE}}-m {{.MODULE}}{{end}}
+
+  # The whole stack from a clean clone, in dependency order. Every step converges, so re-running
+  # on an existing cluster upgrades it in place. Then `task test`.
+  deploy:
+    desc: "Create the kind cluster, install Istio + the shopflow-infra umbrella + dashboards, deploy the services"
+    cmds:
+      # kind cluster → Istio → shopflow-infra (monitoring, Strimzi + Kafka, PostgreSQL, Grafana,
+      # Kafka UI, Gateway) → GrafanaDashboards.
+      - task: cluster:up
+      # skaffold: build the service images, load them into kind, deploy the service charts.
+      - task: run
+
+  # kind maps the ingress gateway's NodePort to localhost:30080 (deploy/local/kind/cluster.yaml),
+  # so no port-forward is needed. Override with GATEWAY_URL=... for another entry point.
+  test:
+    desc: Check the workloads, then run the E2E suite and the k6 load test
+    cmds:
+      # Sequential, cheapest first: no point running E2E against unhealthy pods, or
+      # load-testing a deployment that fails functionally.
+      - task: test:workload
+      - task: test:e2e
+      - task: test:k6s
+
+  # Per service: rollout complete and pods Ready, the gateway route answers /health, and the
+  # chart's own `helm test` (an in-cluster pod calling the Service) passes. Releases are the
+  # skaffold Helm deployer's, named after the service in {{.NAMESPACE}}.
+  test:workload:
+    desc: "Check each service is healthy (rollout, gateway /health) and run its helm tests"
+    vars:
+      GATEWAY_URL: '{{.GATEWAY_URL | default "http://localhost:30080"}}'
+      SERVICES: order-service payment-service inventory-service
+    preconditions:
+      - *cluster_exists
+      - *kind_context
+    cmds:
+      - for: { var: SERVICES }
+        task: _test_workload
+        vars:
+          SERVICE: "{{.ITEM}}"
+          GATEWAY_URL: "{{.GATEWAY_URL}}"
+
+  _test_workload:
+    internal: true
+    requires:
+      vars: [SERVICE, GATEWAY_URL]
+    preconditions:
+      - sh: helm --kube-context {{.CONTEXT}} -n {{.NAMESPACE}} status {{.SERVICE}} >/dev/null 2>&1
+        msg: "No Helm release {{.SERVICE}} in {{.NAMESPACE}}: deploy the services first (task run)"
+    cmds:
+      - kubectl --context {{.CONTEXT}} -n {{.NAMESPACE}} rollout status deployment/{{.SERVICE}} --timeout=180s
+      - |
+        code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' {{.GATEWAY_URL}}/{{.SERVICE}}/health || true)
+        if [ "$code" != "200" ]; then
+          echo "✗ {{.SERVICE}}: GET {{.GATEWAY_URL}}/{{.SERVICE}}/health returned ${code:-no response}" >&2
+          exit 1
+        fi
+        echo "✓ {{.SERVICE}}: gateway /health 200"
+      # No --logs: it dumps the test pod's istio-proxy logs too. On failure, show the test
+      # containers' own output (the pod is kept: hook-delete-policy only removes successes).
+      - |
+        if ! helm --kube-context {{.CONTEXT}} -n {{.NAMESPACE}} test {{.SERVICE}} --timeout 3m; then
+          sel=app.kubernetes.io/instance={{.SERVICE}},app.kubernetes.io/component=test
+          for c in $(kubectl --context {{.CONTEXT}} -n {{.NAMESPACE}} get pods -l "$sel" -o jsonpath='{.items[0].spec.containers[*].name}'); do
+            kubectl --context {{.CONTEXT}} -n {{.NAMESPACE}} logs -l "$sel" -c "$c" --tail=50 >&2 || true
+          done
+          exit 1
+        fi
+
+  test:e2e:
+    desc: Run the E2E suite through the Istio ingress gateway
+    dir: e2e
+    vars:
+      GATEWAY_URL: '{{.GATEWAY_URL | default "http://localhost:30080"}}'
+    env:
+      GATEWAY_URL: "{{.GATEWAY_URL}}"
+    cmds:
+      - python3 -m venv .venv
+      - .venv/bin/pip install --quiet --disable-pip-version-check -r requirements.txt
+      - .venv/bin/python -m pytest -v --tb=short --timeout=180 -p no:cacheprovider
+
+  # Thresholds in the script make k6 exit non-zero, which fails the task (and CI).
+  test:k6s:
+    desc: "Load-test the checkout flow with k6 through the gateway (K6_PROFILE=smoke|load)"
+    vars:
+      GATEWAY_URL: '{{.GATEWAY_URL | default "http://localhost:30080"}}'
+      K6_PROFILE: '{{.K6_PROFILE | default "load"}}'
+    preconditions:
+      - sh: command -v k6
+        msg: "k6 not found — run inside `devbox shell` (devbox.json pins k6)"
+    cmds:
+      - k6 run --no-usage-report -e GATEWAY_URL={{.GATEWAY_URL}} -e K6_PROFILE={{.K6_PROFILE}} .k6s/checkout.js
+
+  # Local generated files only; the cluster itself is `cluster:down`.
+  # Pair with `task cluster:down` for a full teardown: `task cluster:down clean`.
+  clean:
+    desc: Remove generated artifacts (E2E virtualenv, rendered manifests, Helm dependency archives)
+    cmds:
+      - rm -rf e2e/.venv {{.OUTPUT_DIR}}
+      - find deploy -path '*/charts/*/charts/*.tgz' -delete
+
+  status:
+    desc: Show workloads, Helm releases, Istio routes and warning events on the kind cluster
+    preconditions:
+      - *cluster_exists
+      - *kind_context
+    cmds:
+      - kubectl --context {{.CONTEXT}} get pods -A -o wide
+      - helm --kube-context {{.CONTEXT}} list -A
+      - kubectl --context {{.CONTEXT}} get gateway,virtualservice -A
+      - kubectl --context {{.CONTEXT}} get events -A --field-selector type=Warning --sort-by=.lastTimestamp
+
+  ci:versions:
+    desc: Check the CI (setup-tools) and devcontainer tool pins match devbox.lock
+    cmds:
+      - ./scripts/check-ci-versions.sh

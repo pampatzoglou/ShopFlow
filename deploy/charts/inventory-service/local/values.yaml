@@ -1,0 +1,17 @@
+# -- Local kind inner loop only: layered last by skaffold.yaml, over values.yaml ->
+# -- defaults/values.yaml. Never used by ArgoCD (dev/ and prod/ are the cluster envs).
+# -- Skaffold builds the Dockerfile `develop` stage, which differs from `production`:
+# -- it runs as root (files are root-owned), writes into /app at runtime, and file sync
+# -- (kubectl exec + tar) needs a writable rootfs. Relax only what that requires.
+
+podSecurityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+
+securityContext:
+  readOnlyRootFilesystem: false
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0

@@ -1,0 +1,120 @@
+# ShopFlow services × environments. Synced from deploy/argo/ by the platform app-of-apps.
+#
+#   order-service-dev   payment-service-dev   inventory-service-dev    → cluster `dev`
+#   order-service-prod  payment-service-prod  inventory-service-prod   → cluster `prod`
+#
+#   dev   chart from git `main`, image ghcr.io/pampatzoglou/shopflow/<app>:main (Always)
+#   prod  chart from a pinned commit, image pinned by digest. Both live in the prod element
+#         below and move together in one PR opened by .github/workflows/release.yaml
+#         (`task promote:prod`); merging that PR is the prod rollout. A service without a
+#         digest fails to render (image.requireDigest in prod/values.yaml) rather than run
+#         a floating tag.
+#
+# Values layering mirrors `task template` plus the env layer:
+#   values.yaml -> defaults/values.yaml -> <env>/values.yaml
+# (<chart>/local/values.yaml is the skaffold-only overlay and is never referenced here.)
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: shopflow-apps
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/refresh: hard
+    description: "ShopFlow order, payment and inventory services on the dev and prod clusters"
+  labels:
+    owner: shopflow-platform
+    argocd.argoproj.io/instance: shopflow
+spec:
+  goTemplate: true
+  goTemplateOptions:
+    - missingkey=default
+  generators:
+    - matrix:
+        generators:
+          - list:
+              elements:
+                # Same wave: the services only depend on each other at request time.
+                - app: order-service
+                  wave: "10"
+                - app: payment-service
+                  wave: "10"
+                - app: inventory-service
+                  wave: "10"
+          - list:
+              elements:
+                # `cluster` is the destination name the cluster is registered under in ArgoCD.
+                - env: dev
+                  cluster: dev
+                  revision: main
+                # Written by `task promote:prod`; edit by hand only to roll back.
+                - env: prod
+                  cluster: prod
+                  revision: 8b7466b6af927a2944fe2cf71295e556d5c76bf6
+                  digests:
+                    order-service: ""
+                    payment-service: ""
+                    inventory-service: ""
+  # Elements that pin digests (prod) get image.digest as a Helm parameter; parameters
+  # override valueFiles. Elements without `digests` (dev) render from values files only.
+  templatePatch: |
+    {{- if .digests }}
+    spec:
+      source:
+        helm:
+          parameters:
+            - name: image.digest
+              value: {{ index .digests .app | quote }}
+    {{- end }}
+  template:
+    metadata:
+      name: "{{ .app }}-{{ .env }}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{ .wave }}"
+        argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+      labels:
+        argocd.argoproj.io/instance: shopflow
+        owner: shopflow-platform
+        app.kubernetes.io/part-of: shopflow
+        env: "{{ .env }}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/pampatzoglou/ShopFlow
+        targetRevision: "{{ .revision }}"
+        path: "deploy/charts/{{ .app }}"
+        helm:
+          # Bare app name, not <app>-<env>: each env is its own cluster, and the release name
+          # becomes the Service name the other services call (http://order-service:8080) and
+          # the ingress prefix (/order-service). Changing it recreates every resource.
+          releaseName: "{{ .app }}"
+          valueFiles:
+            - values.yaml
+            - defaults/values.yaml
+            - "{{ .env }}/values.yaml"
+          ignoreMissingValueFiles: true
+      destination:
+        name: "{{ .cluster }}"
+        namespace: shopflow
+      syncPolicy:
+        automated: {} # prune and selfHeal stay false: nothing is deleted on its own
+        managedNamespaceMetadata:
+          labels:
+            owner: shopflow-platform
+            istio-injection: enabled
+            monitoring: "true"
+            audit.kubernetes.io/enabled: "true"
+            # restricted works with the sidecar only because the clusters run the Istio CNI
+            # plugin (no privileged istio-init container), as the local kind cluster does.
+            pod-security.kubernetes.io/enforce: restricted
+            pod-security.kubernetes.io/enforce-version: latest
+            pod-security.kubernetes.io/audit: restricted
+            pod-security.kubernetes.io/warn: restricted
+            pod-security.kubernetes.io/warn-version: latest
+            policies.kyverno.io/enforce: "false"
+            quota.kubernetes.io/enforced: "true"
+        syncOptions:
+          - Validate=true
+          - CreateNamespace=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+          - Wait=true

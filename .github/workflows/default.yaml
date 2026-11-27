@@ -1,0 +1,114 @@
+# CI for ShopFlow. Jobs install tools via ./.github/actions/setup-tools and call Taskfile
+# tasks, so every step runs the same way locally (`task lint`, `task build:<svc>`, ...).
+#
+#   push (any branch)    lint → build (one job per service)
+#   pull_request → main  e2e: kind cluster + Istio + infra, deploy via skaffold, E2E suite
+#
+# A PR from a branch in this repo gets both: the push run (lint/build) and the PR run (e2e).
+name: Default
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # main publishes images: never cancel a half-pushed/half-signed build there.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: Lint
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+        with:
+          yq: "true"
+          helm: "true"
+          kubescape: "true"
+          hadolint: "true"
+      # CI tool-version parity with devbox.json, hadolint, helm lint --strict, kubescape.
+      - run: task lint
+
+  build:
+    name: Build (${{ matrix.service }})
+    if: github.event_name == 'push'
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write       # push to ghcr (main only)
+      id-token: write       # OIDC token for provenance + keyless cosign
+      attestations: write   # record the build-provenance attestation
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [order-service, payment-service, inventory-service]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Production stage. Other branches only build; main pushes :main + :sha-<commit>
+      # and attaches build provenance and a cosign signature, both bound to the digest.
+      - id: image
+        uses: ./.github/actions/build-push
+        with:
+          image-name: ghcr.io/pampatzoglou/shopflow/${{ matrix.service }}
+          context: services/${{ matrix.service }}
+          file: services/${{ matrix.service }}/Dockerfile
+          target: production
+          push: ${{ github.ref == 'refs/heads/main' }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Summary
+        env:
+          TAGS: ${{ steps.image.outputs.tags }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          {
+            echo "### ${{ matrix.service }}"
+            echo "digest: \`$DIGEST\`"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: E2E on kind
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tools
+        with:
+          python: "true"
+          yq: "true"
+          helm: "true"
+          kubectl: "true"
+          kind: "true"
+          istioctl: "true"
+          skaffold: "true"
+          k6: "true"
+      # The evaluated entry point: kind cluster, Istio, shopflow-infra umbrella, dashboards,
+      # then the services via skaffold.
+      - run: task deploy
+      # E2E suite, then the k6 load test, through the Istio ingress gateway (kind maps it to
+      # localhost:30080). Failed k6 thresholds fail the job.
+      - run: task test
+      - name: Cluster state
+        if: failure()
+        run: task status

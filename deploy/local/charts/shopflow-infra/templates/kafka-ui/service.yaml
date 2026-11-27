@@ -1,0 +1,18 @@
+{{- if .Values.kafkaUi.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.kafkaUi.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "kafka-ui" "component" "ui") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "shopflow-infra.selectorLabels" (dict "root" . "name" "kafka-ui" "component" "ui") | nindent 4 }}
+{{- end }}

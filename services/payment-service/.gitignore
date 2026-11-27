@@ -1,0 +1,22 @@
+# Local-only files for this service. What the image build excludes is .dockerignore's job.
+# package-lock.json is committed: `npm ci` in the Dockerfile needs it.
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key
+
+# npm / TypeScript output
+node_modules/
+dist/
+coverage/
+
+# Overrides a global gitignore that excludes lockfiles (wins over core.excludesFile).
+!package-lock.json

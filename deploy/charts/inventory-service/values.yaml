@@ -1,0 +1,237 @@
+# -- Base layer: renders and runs on a bare local kind cluster with no overlays.
+# -- Operational hardening and sizing live in defaults/values.yaml.
+
+replicaCount: 1
+
+image:
+  repository: inventory-service
+  # -- Local images are built as :latest inside the cluster's Docker daemon (task build).
+  # -- Pin a release tag or digest in any non-local overlay.
+  tag: latest
+  digest: ""
+  # -- Fail rendering when digest is empty (set in prod/values.yaml).
+  requireDigest: false
+  # -- Never: images are side-loaded into kind, there is no registry to pull from.
+  pullPolicy: Never
+
+nameOverride: ""
+fullnameOverride: ""
+partOf: shopflow
+imagePullSecrets: []
+
+containerPort: 8080
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# -- Database connection and credentials.
+# -- Maps to the `<fullname>-db` Secret, DB_* env vars, and /var/run/secrets/db/* files.
+database:
+  host: postgres.shopflow.svc.cluster.local
+  port: "5432"
+  database: inventory
+  username: postgres
+  password: postgres
+  mountPath: /var/run/secrets/db
+  externalSecret:
+    enable: false
+    name: ""
+    usernameKey: username
+    passwordKey: password
+  vault:
+    enable: false
+    method: GET
+    provider:
+      server: http://vault.vault:8200
+      version: v2
+    resultType: Data
+    path: ""
+    usernameKey: username
+    passwordKey: password
+    refreshInterval: "1h"
+
+# -- Chart-level Vault Kubernetes auth — used only when database.vault.enable is true.
+vault:
+  mountPath: kubernetes
+  role: ""
+
+# -- Plain (non-secret) env vars. Values are rendered through tpl.
+# -- A map rather than a list so overlay layers merge instead of replacing.
+env:
+  UVICORN_PORT: "8080"
+  ORDER_SERVICE_URL: http://order-service:8080
+  PAYMENT_SERVICE_URL: http://payment-service:8080
+
+serviceAccount:
+  create: true
+  # -- The service never calls the Kubernetes API.
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+resources: {}
+# resources:
+#   requests:
+#     cpu: 100m
+#     memory: 256Mi
+#   limits:
+#     cpu: "1"
+#     memory: 256Mi
+
+# -- /health is dependency-free (liveness); /ready checks the database (readiness).
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 5
+  failureThreshold: 30
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 15
+  timeoutSeconds: 3
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 2
+
+strategy: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+  metrics: []
+  behavior: {}
+#   behavior:
+#     scaleDown:
+#       stabilizationWindowSeconds: 300
+
+# -- Pod-level allow-list (templates/networkpolicy.yaml). Off in the base layer so the chart
+# -- runs on any cluster; defaults/values.yaml turns it on with the real rules. Each direction
+# -- is enforced only once it has rules (`policyTypes` is derived from the lists).
+networkPolicy:
+  enabled: false
+  ingress: []
+  egress: []
+#   enabled: true
+#   ingress:
+#     - from:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: istio-system
+#           podSelector:
+#             matchLabels:
+#               istio: ingressgateway
+#       ports:
+#         - port: http
+#   egress:
+#     # DNS first, or every other egress rule silently fails name resolution
+#     - to:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: kube-system
+#           podSelector:
+#             matchLabels:
+#               k8s-app: kube-dns
+#       ports:
+#         - port: 53
+#           protocol: UDP
+#         - port: 53
+#           protocol: TCP
+
+# -- Istio AuthorizationPolicy (templates/authorizationpolicy.yaml): ALLOW rules by caller
+# -- identity, method and path; anything else gets 403. Needs Istio, so off in the base layer;
+# -- defaults/values.yaml turns it on with the rules matching what each caller really calls.
+# -- Paths take Istio templates: `{*}` is one path segment.
+authorizationPolicy:
+  enabled: false
+  rules: []
+
+pdb:
+  enabled: false
+#   enabled: true
+#   maxUnavailable: 1
+
+# -- Istio ingress routing: <prefix>/* on the shared ingress Gateway, prefix stripped before
+# -- it reaches the service. Needs Istio, so off in the base layer (see defaults/values.yaml).
+virtualService:
+  enabled: false
+  # -- Defaults to /<fullname>.
+  prefix: ""
+  hosts:
+    - "*"
+  # -- <namespace>/<name> of the Istio Gateway (shopflow-infra chart).
+  gateways: []
+  timeout: ""
+
+# -- Prometheus metrics. The app always serves them on `port` (METRICS_PORT env) at `path`;
+# -- this block controls collection and alerting.
+# -- In the Istio mesh, `enabled` adds prometheus.io/* pod annotations: Istio merges the app's
+# -- metrics into the sidecar scrape (kube-prometheus-stack's envoy-stats PodMonitor), so no
+# -- per-service PodMonitor is needed. Off the mesh, also enable `podMonitor` — never both,
+# -- or every series is scraped twice.
+metrics:
+  enabled: false
+  port: 9090
+  path: /metrics
+  podMonitor:
+    enabled: false
+    interval: 30s
+    additionalLabels: {}
+  # -- Alerts on Istio request metrics (RED), kube-state-metrics/cAdvisor and app metrics.
+  # -- Thresholds are tunable per environment; `extraRules` appends a group of raw rules.
+  prometheusRule:
+    enabled: false
+    additionalLabels: {}
+    # -- 5xx ratio of inbound requests; ignored below minRequestRate (req/s) to avoid noise.
+    errorRate:
+      threshold: 0.05
+      minRequestRate: 0.1
+      for: 10m
+    latency:
+      p99Milliseconds: 500
+      for: 10m
+    # -- Failed outbound calls (5xx or no response) per destination service.
+    upstreamErrorRate:
+      threshold: 0.05
+      minRequestRate: 0.1
+      for: 10m
+    # -- Working set / memory limit.
+    memory:
+      limitRatio: 0.9
+      for: 15m
+    # -- asyncpg pool at max size with no idle connections.
+    dbPoolExhausted:
+      for: 5m
+    # -- Reservations rejected for insufficient stock / all reservations. A business
+    # -- signal (restock needed), so severity is info.
+    insufficientStockRate:
+      threshold: 0.2
+      minRate: 0.05
+      for: 15m
+    extraRules: []
+
+volumes: []
+volumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+extraObjects: []

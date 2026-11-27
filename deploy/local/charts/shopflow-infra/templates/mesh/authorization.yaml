@@ -1,0 +1,91 @@
+{{- /* Istio authorization for the shopflow namespace: a namespace-wide default deny, plus the
+       allow rules for this chart's meshed workloads. The service charts bring their own
+       AuthorizationPolicy. Callers are matched by mTLS identity; workloads without a sidecar
+       (the Kafka pods) are not affected. */ -}}
+{{- $a := .Values.mesh.authorization -}}
+{{- if $a.enabled }}
+{{- $ns := .Values.namespace -}}
+# Empty spec = allow nothing: any workload in the namespace that no ALLOW policy selects
+# rejects every request (403 for HTTP, connection reset for TCP).
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: default-deny
+  namespace: {{ $ns }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "mesh" "component" "authorization") | nindent 4 }}
+spec: {}
+{{- if .Values.postgres.enabled }}
+---
+# PostgreSQL: only the services that own a database.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Values.postgres.serviceName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "postgres" "component" "database") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "shopflow-infra.selectorLabels" (dict "root" . "name" "postgres" "component" "database") | nindent 6 }}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              {{- range $a.databaseClients }}
+              - cluster.local/ns/{{ $ns }}/sa/{{ . }}
+              {{- end }}
+      to:
+        - operation:
+            ports: [{{ .Values.postgres.port | quote }}]
+{{- end }}
+{{- if .Values.kafkaUi.enabled }}
+---
+# Kafka UI: only through the ingress gateway (/kafka).
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Values.kafkaUi.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "kafka-ui" "component" "ui") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "shopflow-infra.selectorLabels" (dict "root" . "name" "kafka-ui" "component" "ui") | nindent 6 }}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - {{ $a.ingressGatewayPrincipal }}
+{{- end }}
+{{- if .Values.grafana.enabled }}
+---
+# ShopFlow Grafana: the ingress gateway (/grafana) and the Grafana operator (in the mesh via its
+# pod label), which reconciles datasources and dashboards through the API.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Values.grafana.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "grafana" "component" "dashboards") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.grafana.name }}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - {{ $a.ingressGatewayPrincipal }}
+              - {{ $a.grafanaOperatorPrincipal }}
+      to:
+        - operation:
+            ports: ["3000"]
+{{- end }}
+{{- end }}

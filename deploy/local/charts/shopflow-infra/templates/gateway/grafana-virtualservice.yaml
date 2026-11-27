@@ -1,0 +1,31 @@
+{{- $g := .Values.grafana -}}
+{{- if and .Values.gateway.enabled $g.enabled $g.route.enabled }}
+{{- $prefix := $g.route.prefix | trimSuffix "/" -}}
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: {{ $g.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "grafana" "component" "ingress") | nindent 4 }}
+spec:
+  hosts:
+    {{- toYaml .Values.gateway.hosts | nindent 4 }}
+  gateways:
+    - {{ .Values.gateway.name }}
+  http:
+    - name: {{ $g.name }}
+      match:
+        - uri:
+            prefix: {{ $prefix }}/
+        - uri:
+            exact: {{ $prefix }}
+      # Grafana serves from /; its root_url makes the links it renders carry the prefix.
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: {{ $g.name }}-service.{{ .Values.namespace }}.svc.cluster.local
+            port:
+              number: 3000
+{{- end }}

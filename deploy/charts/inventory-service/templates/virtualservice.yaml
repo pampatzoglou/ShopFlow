@@ -1,0 +1,34 @@
+{{- if .Values.virtualService.enabled }}
+{{- $fullName := include "inventory-service.fullname" . -}}
+{{- $prefix := .Values.virtualService.prefix | default (printf "/%s" $fullName) | trimSuffix "/" -}}
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "inventory-service.componentLabels" (dict "root" . "component" "server") | nindent 4 }}
+spec:
+  hosts:
+    {{- toYaml .Values.virtualService.hosts | nindent 4 }}
+  gateways:
+    {{- toYaml (required "virtualService.gateways is required" .Values.virtualService.gateways) | nindent 4 }}
+  http:
+    - name: {{ $fullName }}
+      # "{{ $prefix }}/" rather than a bare prefix, so "{{ $prefix }}-other" doesn't match.
+      match:
+        - uri:
+            prefix: {{ $prefix }}/
+        - uri:
+            exact: {{ $prefix }}
+      # The service serves /health, /api/...: strip the routing prefix.
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: {{ $fullName }}.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      {{- with .Values.virtualService.timeout }}
+      timeout: {{ . }}
+      {{- end }}
+{{- end }}

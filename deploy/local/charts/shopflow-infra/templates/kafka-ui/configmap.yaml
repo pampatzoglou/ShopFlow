@@ -1,0 +1,16 @@
+{{- if .Values.kafkaUi.enabled }}
+{{- $ui := .Values.kafkaUi -}}
+{{- $clusters := dict "kafka" (dict "clusters" (list (dict
+      "name" .Values.kafka.name
+      "bootstrapServers" (printf "%s-kafka-bootstrap.%s.svc.cluster.local:9092" .Values.kafka.name .Values.kafka.namespace)))) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $ui.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "kafka-ui" "component" "ui") | nindent 4 }}
+data:
+  config.yml: |
+    {{- mergeOverwrite (deepCopy $ui.extraConfig) $clusters | toYaml | nindent 4 }}
+{{- end }}

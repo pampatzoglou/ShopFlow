@@ -1,0 +1,6 @@
+# -- dev cluster (ArgoCD, deploy/argo/applicationset.yaml): tracks git `main` and the
+# -- image CI publishes from `main`. Always: the tag moves, so re-pull on every rollout.
+image:
+  repository: ghcr.io/pampatzoglou/shopflow/inventory-service
+  tag: main
+  pullPolicy: Always

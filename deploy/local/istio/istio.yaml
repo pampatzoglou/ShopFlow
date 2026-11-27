@@ -1,0 +1,66 @@
+# Istio for the local kind cluster: sidecar mode, with the Istio CNI plugin doing the
+# traffic redirect instead of a privileged istio-init container per pod.
+# Applied by `task cluster:istio` via `istioctl install -f`.
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: shopflow
+  namespace: istio-system
+spec:
+  profile: demo
+  meshConfig:
+    # Explicit rather than inherited from the demo profile: the envoy-stats PodMonitor
+    # (kube-prometheus-stack values) relies on the sidecar serving merged app + Envoy
+    # metrics on :15020/stats/prometheus.
+    enablePrometheusMerge: true
+    accessLogFile: /dev/stdout
+  components:
+    cni:
+      enabled: true
+    pilot:
+      k8s:
+        # Sized for a single-node kind cluster.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+    egressGateways:
+      - name: istio-egressgateway
+        enabled: false
+    ingressGateways:
+      - name: istio-ingressgateway
+        enabled: true
+        k8s:
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+          # kind has no LoadBalancer; fixed NodePorts match extraPortMappings in kind/cluster.yaml.
+          service:
+            type: NodePort
+            ports:
+              - name: status-port
+                port: 15021
+                targetPort: 15021
+              - name: http2
+                port: 80
+                targetPort: 8080
+                nodePort: 30080
+              - name: https
+                port: 443
+                targetPort: 8443
+                nodePort: 30443
+  values:
+    cni:
+      # kind nodes use the standard CNI paths; set explicitly so a profile change can't move them.
+      cniBinDir: /opt/cni/bin
+      cniConfDir: /etc/cni/net.d
+    # One replica each, no HPA (explicit: the demo profile's default could change).
+    gateways:
+      istio-ingressgateway:
+        autoscaleEnabled: false
+    pilot:
+      autoscaleEnabled: false
+      cni:
+        # Injector omits istio-init and relies on the CNI plugin for redirection.
+        enabled: true

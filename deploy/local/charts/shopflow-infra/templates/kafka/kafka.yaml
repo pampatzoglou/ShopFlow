@@ -1,0 +1,104 @@
+{{- if .Values.kafka.enabled }}
+{{- $k := .Values.kafka -}}
+{{- $ctx := dict "root" . "name" "kafka" "component" "broker" -}}
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: {{ $k.name }}-dual-role
+  namespace: {{ $k.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" $ctx | nindent 4 }}
+    strimzi.io/cluster: {{ $k.name }}
+spec:
+  replicas: {{ $k.replicas }}
+  # Combined controller + broker: one KRaft node is enough for local development.
+  roles:
+    - controller
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: {{ $k.storage.size }}
+        deleteClaim: {{ $k.storage.deleteClaim }}
+        kraftMetadata: shared
+        {{- with $k.storage.storageClassName }}
+        class: {{ . }}
+        {{- end }}
+  resources:
+    {{- toYaml $k.resources | nindent 4 }}
+  jvmOptions:
+    {{- toYaml $k.jvmOptions | nindent 4 }}
+  template:
+    pod:
+      metadata:
+        labels:
+          {{- toYaml $k.podLabels | nindent 10 }}
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: {{ $k.name }}
+  namespace: {{ $k.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" $ctx | nindent 4 }}
+spec:
+  kafka:
+    version: {{ $k.version }}
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+    config:
+      # Single node: every internal topic has exactly one replica.
+      {{- $rf := $k.replicas | int }}
+      offsets.topic.replication.factor: {{ $rf }}
+      transaction.state.log.replication.factor: {{ $rf }}
+      transaction.state.log.min.isr: 1
+      default.replication.factor: {{ $rf }}
+      min.insync.replicas: 1
+      auto.create.topics.enable: {{ $k.autoCreateTopics }}
+    {{- if $k.metrics.enabled }}
+    # Strimzi Metrics Reporter: native Prometheus endpoint on :9404 (port tcp-prometheus),
+    # no JMX exporter rules to maintain. allowList keeps the series count bounded.
+    metricsConfig:
+      type: strimziMetricsReporter
+      values:
+        allowList:
+          {{- toYaml $k.metrics.allowList | nindent 10 }}
+    {{- end }}
+  {{- if $k.metrics.enabled }}
+  # Topic/partition offsets and consumer-group lag, which the broker itself doesn't expose.
+  kafkaExporter:
+    topicRegex: ".*"
+    groupRegex: ".*"
+    resources:
+      requests:
+        cpu: 20m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    template:
+      pod:
+        metadata:
+          labels:
+            {{- toYaml $k.podLabels | nindent 12 }}
+  {{- end }}
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+    template:
+      pod:
+        metadata:
+          labels:
+            {{- toYaml $k.podLabels | nindent 12 }}
+{{- end }}

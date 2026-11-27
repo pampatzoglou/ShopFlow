@@ -1,0 +1,189 @@
+{{- /*
+  Alerts for this service from three sources, all available without per-service scrape config:
+    - Istio request metrics (istio_*), reported by the sidecar: inbound RED + outbound calls.
+    - kube-state-metrics / cAdvisor (kube-prometheus-stack): availability, memory.
+    - The app's own metrics (merged into the sidecar scrape), selected by the `app` label.
+  Prometheus template expressions are wrapped in {{` `}} so Helm leaves them alone.
+*/ -}}
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled }}
+{{- $r := .Values.metrics.prometheusRule }}
+{{- $ns := .Release.Namespace }}
+{{- $workload := include "inventory-service.fullname" . }}
+{{- $app := include "inventory-service.name" . }}
+{{- $dst := printf "reporter=\"destination\", destination_workload_namespace=\"%s\", destination_workload=\"%s\"" $ns $workload }}
+{{- $src := printf "reporter=\"source\", source_workload_namespace=\"%s\", source_workload=\"%s\"" $ns $workload }}
+{{- $self := printf "namespace=\"%s\", app=\"%s\"" $ns $app }}
+{{- $component := dict "root" . "component" "server" }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $workload }}
+  labels:
+    {{- include "inventory-service.componentLabels" $component | nindent 4 }}
+    {{- with $r.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ $workload }}.istio
+      rules:
+        - record: workload:istio_requests:rate5m
+          expr: |
+            sum by (destination_workload_namespace, destination_workload) (
+              rate(istio_requests_total{ {{- $dst -}} }[5m]))
+        - record: workload:istio_requests_5xx:ratio_rate5m
+          expr: |
+            sum by (destination_workload_namespace, destination_workload) (
+              rate(istio_requests_total{ {{- $dst -}}, response_code=~"5.."}[5m]))
+            /
+            sum by (destination_workload_namespace, destination_workload) (
+              rate(istio_requests_total{ {{- $dst -}} }[5m]))
+        - record: workload:istio_request_duration_milliseconds:p99_5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (destination_workload_namespace, destination_workload, le) (
+                rate(istio_request_duration_milliseconds_bucket{ {{- $dst -}} }[5m])))
+        # Outbound, per destination. response_code="0": no response at all (connect
+        # failure, reset, timeout) — see response_flags for why.
+        - record: workload_destination:istio_requests:rate5m
+          expr: |
+            sum by (source_workload_namespace, source_workload, destination_service_name) (
+              rate(istio_requests_total{ {{- $src -}} }[5m]))
+        - record: workload_destination:istio_requests_failed:ratio_rate5m
+          expr: |
+            sum by (source_workload_namespace, source_workload, destination_service_name) (
+              rate(istio_requests_total{ {{- $src -}}, response_code=~"5..|0"}[5m]))
+            /
+            sum by (source_workload_namespace, source_workload, destination_service_name) (
+              rate(istio_requests_total{ {{- $src -}} }[5m]))
+
+        - alert: ShopFlowHighErrorRate
+          expr: |
+            workload:istio_requests_5xx:ratio_rate5m{destination_workload_namespace="{{ $ns }}", destination_workload="{{ $workload }}"}
+              > {{ $r.errorRate.threshold }}
+            and on (destination_workload_namespace, destination_workload)
+            workload:istio_requests:rate5m{destination_workload_namespace="{{ $ns }}", destination_workload="{{ $workload }}"}
+              > {{ $r.errorRate.minRequestRate }}
+          for: {{ $r.errorRate.for }}
+          labels:
+            severity: warning
+            service: {{ $app }}
+          annotations:
+            summary: "{{ $app }} is failing {{`{{ $value | humanizePercentage }}`}} of requests"
+            description: >-
+              More than {{ $r.errorRate.threshold }} of inbound requests to {{ $workload }}
+              in {{ $ns }} returned 5xx over the last 5m (Istio, destination-reported).
+
+        - alert: ShopFlowHighLatency
+          expr: |
+            workload:istio_request_duration_milliseconds:p99_5m{destination_workload_namespace="{{ $ns }}", destination_workload="{{ $workload }}"}
+              > {{ $r.latency.p99Milliseconds }}
+          for: {{ $r.latency.for }}
+          labels:
+            severity: warning
+            service: {{ $app }}
+          annotations:
+            summary: "{{ $app }} p99 latency is {{`{{ $value | humanize }}`}}ms"
+            description: >-
+              p99 of inbound request duration for {{ $workload }} in {{ $ns }} has been above
+              {{ $r.latency.p99Milliseconds }}ms for {{ $r.latency.for }}.
+
+        - alert: ShopFlowUpstreamErrors
+          expr: |
+            workload_destination:istio_requests_failed:ratio_rate5m{source_workload_namespace="{{ $ns }}", source_workload="{{ $workload }}"}
+              > {{ $r.upstreamErrorRate.threshold }}
+            and on (source_workload_namespace, source_workload, destination_service_name)
+            workload_destination:istio_requests:rate5m{source_workload_namespace="{{ $ns }}", source_workload="{{ $workload }}"}
+              > {{ $r.upstreamErrorRate.minRequestRate }}
+          for: {{ $r.upstreamErrorRate.for }}
+          labels:
+            severity: warning
+            service: {{ $app }}
+          annotations:
+            summary: >-
+              {{ $app }} calls to {{`{{ $labels.destination_service_name }}`}} are failing
+              ({{`{{ $value | humanizePercentage }}`}})
+            description: >-
+              Outbound requests from {{ $workload }} to
+              {{`{{ $labels.destination_service_name }}`}} returned 5xx or no response. Check
+              response_flags on istio_requests_total{reporter="source"} for the cause
+              (UF = connect failure, UH = no healthy upstream, URX = retries exhausted).
+
+    - name: {{ $workload }}.kubernetes
+      rules:
+        - alert: ShopFlowServiceUnavailable
+          expr: |
+            kube_deployment_status_replicas_available{namespace="{{ $ns }}", deployment="{{ $workload }}"} == 0
+            and on (namespace, deployment)
+            kube_deployment_spec_replicas{namespace="{{ $ns }}", deployment="{{ $workload }}"} > 0
+          for: 2m
+          labels:
+            severity: critical
+            service: {{ $app }}
+          annotations:
+            summary: "{{ $app }} has no available replicas"
+            description: >-
+              Deployment {{ $workload }} in {{ $ns }} wants replicas but none have been
+              available for 2m.
+
+        - alert: ShopFlowMemoryNearLimit
+          expr: |
+            max by (namespace, pod, container) (
+              container_memory_working_set_bytes{namespace="{{ $ns }}", container="{{ .Chart.Name }}", pod=~"{{ $workload }}-.*"})
+            / on (namespace, pod, container)
+            max by (namespace, pod, container) (
+              kube_pod_container_resource_limits{resource="memory", namespace="{{ $ns }}", container="{{ .Chart.Name }}", pod=~"{{ $workload }}-.*"})
+              > {{ $r.memory.limitRatio }}
+          for: {{ $r.memory.for }}
+          labels:
+            severity: warning
+            service: {{ $app }}
+          annotations:
+            summary: "{{ $app }} pod {{`{{ $labels.pod }}`}} is at {{`{{ $value | humanizePercentage }}`}} of its memory limit"
+            description: >-
+              Working set has been above {{ $r.memory.limitRatio }} of the container memory
+              limit for {{ $r.memory.for }}; next stop is an OOM kill.
+
+    - name: {{ $workload }}.app
+      rules:
+        - alert: ShopFlowDbPoolExhausted
+          expr: |
+            max by (namespace, pod) (shopflow_db_pool_idle_connections{ {{- $self -}} }) == 0
+            and on (namespace, pod)
+            max by (namespace, pod) (shopflow_db_pool_connections{ {{- $self -}} })
+              >= on (namespace, pod)
+            max by (namespace, pod) (shopflow_db_pool_max_connections{ {{- $self -}} } > 0)
+          for: {{ $r.dbPoolExhausted.for }}
+          labels:
+            severity: warning
+            service: {{ $app }}
+          annotations:
+            summary: "{{ $app }} pod {{`{{ $labels.pod }}`}} DB pool is exhausted"
+            description: >-
+              The asyncpg pool has been at max_size with no idle connections for
+              {{ $r.dbPoolExhausted.for }}: requests are queuing for a connection.
+
+        - alert: ShopFlowInsufficientStockRate
+          expr: |
+            sum by (namespace) (rate(shopflow_inventory_reservations_total{ {{- $self -}}, outcome="insufficient_stock"}[15m]))
+            /
+            sum by (namespace) (rate(shopflow_inventory_reservations_total{ {{- $self -}} }[15m]))
+              > {{ $r.insufficientStockRate.threshold }}
+            and on (namespace)
+            sum by (namespace) (rate(shopflow_inventory_reservations_total{ {{- $self -}} }[15m]))
+              > {{ $r.insufficientStockRate.minRate }}
+          for: {{ $r.insufficientStockRate.for }}
+          labels:
+            severity: info
+            service: {{ $app }}
+          annotations:
+            summary: "{{`{{ $value | humanizePercentage }}`}} of reservations rejected for insufficient stock"
+            description: >-
+              Products are running out; see
+              sum by (outcome) (rate(shopflow_inventory_reservations_total[15m])).
+    {{- with $r.extraRules }}
+    - name: {{ $workload }}.extra
+      rules:
+        {{- tpl (toYaml .) $ | nindent 8 }}
+    {{- end }}
+{{- end }}

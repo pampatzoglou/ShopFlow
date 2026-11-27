@@ -1,0 +1,133 @@
+# Local inner loop against the kind cluster from deploy/local (task cluster:up).
+# One config per service so a single one can be run with `-m`:
+#   skaffold dev                      # all three services
+#   skaffold dev -m payment-service   # just one
+# Images are built locally and sideloaded with `kind load` (push: false), which is why
+# the charts' pullPolicy: Never works without a registry. Each service is deployed as a Helm
+# release named after it in `shopflow` (`task test:workload` runs its `helm test`).
+#
+# Every config pins `deploy.kubeContext: kind-shopflow`, so skaffold never deploys to the
+# current kubectl context (which may be a platform cluster). Keep it on any config you add;
+# `task run|dev|undeploy` additionally pass --kube-context and refuse non-kind contexts.
+apiVersion: skaffold/v4beta14
+kind: Config
+metadata:
+  name: order-service
+build:
+  local:
+    push: false
+    useBuildkit: true
+  artifacts:
+    - image: order-service
+      context: services/order-service
+      docker:
+        dockerfile: Dockerfile
+        target: develop
+      # No sync: Kotlin needs a recompile, so source edits trigger a rebuild. The
+      # dependency layer stays cached, so only the bootJar step reruns.
+deploy:
+  kubeContext: kind-shopflow
+  # Helm deployer (not render + kubectl): a real release, so `helm test` and `helm list` work.
+  helm:
+    releases:
+      - name: order-service
+        chartPath: deploy/charts/order-service
+        namespace: shopflow
+        skipTests: true
+        valuesFiles:
+          - deploy/charts/order-service/values.yaml
+          - deploy/charts/order-service/defaults/values.yaml
+          - deploy/charts/order-service/local/values.yaml
+        setValueTemplates:
+          image.repository: "{{.IMAGE_REPO_order_service}}"
+          image.tag: "{{.IMAGE_TAG_order_service}}"
+portForward:
+  - resourceType: service
+    resourceName: order-service
+    namespace: shopflow
+    port: 8080
+    localPort: 8081
+---
+apiVersion: skaffold/v4beta14
+kind: Config
+metadata:
+  name: payment-service
+build:
+  local:
+    push: false
+    useBuildkit: true
+  artifacts:
+    - image: payment-service
+      context: services/payment-service
+      docker:
+        dockerfile: Dockerfile
+        target: develop
+      # `node --watch` restarts on synced .ts files; dependency changes need a rebuild.
+      sync:
+        manual:
+          - src: "src/**/*.ts"
+            dest: .
+deploy:
+  kubeContext: kind-shopflow
+  # Helm deployer (not render + kubectl): a real release, so `helm test` and `helm list` work.
+  helm:
+    releases:
+      - name: payment-service
+        chartPath: deploy/charts/payment-service
+        namespace: shopflow
+        skipTests: true
+        valuesFiles:
+          - deploy/charts/payment-service/values.yaml
+          - deploy/charts/payment-service/defaults/values.yaml
+          - deploy/charts/payment-service/local/values.yaml
+        setValueTemplates:
+          image.repository: "{{.IMAGE_REPO_payment_service}}"
+          image.tag: "{{.IMAGE_TAG_payment_service}}"
+portForward:
+  - resourceType: service
+    resourceName: payment-service
+    namespace: shopflow
+    port: 8080
+    localPort: 8082
+---
+apiVersion: skaffold/v4beta14
+kind: Config
+metadata:
+  name: inventory-service
+build:
+  local:
+    push: false
+    useBuildkit: true
+  artifacts:
+    - image: inventory-service
+      context: services/inventory-service
+      docker:
+        dockerfile: Dockerfile
+        target: develop
+      # `uvicorn --reload` picks up synced .py files; requirements changes need a rebuild.
+      sync:
+        manual:
+          - src: "app/**/*.py"
+            dest: .
+deploy:
+  kubeContext: kind-shopflow
+  # Helm deployer (not render + kubectl): a real release, so `helm test` and `helm list` work.
+  helm:
+    releases:
+      - name: inventory-service
+        chartPath: deploy/charts/inventory-service
+        namespace: shopflow
+        skipTests: true
+        valuesFiles:
+          - deploy/charts/inventory-service/values.yaml
+          - deploy/charts/inventory-service/defaults/values.yaml
+          - deploy/charts/inventory-service/local/values.yaml
+        setValueTemplates:
+          image.repository: "{{.IMAGE_REPO_inventory_service}}"
+          image.tag: "{{.IMAGE_TAG_inventory_service}}"
+portForward:
+  - resourceType: service
+    resourceName: inventory-service
+    namespace: shopflow
+    port: 8080
+    localPort: 8083

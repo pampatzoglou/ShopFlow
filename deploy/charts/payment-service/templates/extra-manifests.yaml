@@ -1,0 +1,4 @@
+{{- range .Values.extraObjects }}
+---
+{{ include "payment-service.render" (dict "value" . "context" $) }}
+{{- end }}

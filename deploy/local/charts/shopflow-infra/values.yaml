@@ -1,0 +1,424 @@
+# One release for all local infrastructure except Istio (installed first by istioctl, so every
+# pod below is created with its sidecar). Release `shopflow-infra`, namespace `kafka-system`.
+#
+#   monitoring    kube-prometheus-stack, Grafana operator           (subcharts, namespaceOverride)
+#   kube-system   metrics-server                                    (subchart, namespaceOverride)
+#   kafka-system  Strimzi cluster operator                          (subchart, release namespace)
+#   shopflow      PostgreSQL, Kafka (+ topics, metrics), Kafka UI,  (templates, `namespace` /
+#                 Grafana, ingress Gateway                            `kafka.namespace` below)
+#
+# The namespaces are part of the release too (`namespaces` below), except kafka-system itself.
+
+partOf: shopflow
+
+# -- Namespaces created by this release (the release's own, kafka-system, is created by
+# -- `helm install --create-namespace` and skipped here). Kept on uninstall.
+namespaces:
+  # ShopFlow services, PostgreSQL, Kafka UI, Grafana: inside the mesh. Kafka too, but its
+  # pods opt out of injection (kafka.podLabels).
+  shopflow:
+    labels:
+      istio-injection: enabled
+  # kube-prometheus-stack and the Grafana operator.
+  monitoring: {}
+
+# -- Namespace of the ShopFlow-facing resources (PostgreSQL, Kafka UI, Grafana, Gateway). The
+# -- service charts hard-code `postgres.shopflow.svc.cluster.local`.
+namespace: shopflow
+
+# -- PostgreSQL: one instance, one database per service.
+postgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "16.16-alpine"
+    digest: "sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e"
+    pullPolicy: IfNotPresent
+  # -- Must stay `postgres`: it is the Service name the service charts connect to.
+  serviceName: postgres
+  port: 5432
+  # -- Chart-internal credentials, matching the service charts' local defaults.
+  auth:
+    username: postgres
+    password: postgres
+  # -- Created on first start only (docker-entrypoint-initdb.d); changing it later needs a
+  # -- fresh volume.
+  databases:
+    - orders
+    - payments
+    - inventory
+  persistence:
+    size: 1Gi
+    storageClassName: ""   # cluster default (kind: local-path)
+  # -- The alpine image's postgres user.
+  uid: 70
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  podAnnotations: {}
+  podLabels: {}
+
+# -- Kafka cluster, reconciled by the Strimzi operator (`strimzi-kafka-operator` below).
+kafka:
+  enabled: true
+  # -- Next to the services that use it. Must be one of `strimzi-kafka-operator.watchNamespaces`.
+  namespace: shopflow
+  # -- Labels on every Kafka pod (broker, topic operator, Kafka Exporter). Out of the mesh
+  # -- although `namespace` has injection on: Strimzi manages its own inter-broker TLS, and
+  # -- sidecars race broker/controller startup. Meshed clients still reach the plain listener
+  # -- (auto-mTLS falls back to plaintext for pods without a sidecar).
+  podLabels:
+    sidecar.istio.io/inject: "false"
+  # -- Cluster name. Bootstrap: <name>-kafka-bootstrap.<namespace>.svc.cluster.local:9092.
+  name: shopflow
+  version: 4.3.2
+  replicas: 1
+  # -- Topics are declared as KafkaTopic CRs; broker-side auto-creation is off so a typo in a
+  # -- producer fails loudly instead of silently creating a new topic.
+  autoCreateTopics: false
+  storage:
+    size: 2Gi
+    storageClassName: ""
+    # -- Local cluster: drop the PVC with the cluster.
+    deleteClaim: true
+  resources:
+    requests:
+      cpu: 200m
+      memory: 768Mi
+    limits:
+      cpu: "1"
+      memory: 768Mi
+  jvmOptions:
+    -Xms: 384m
+    -Xmx: 384m
+  # -- Broker metrics (Strimzi Metrics Reporter) + Kafka Exporter (lag), scraped by a
+  # -- PodMonitor in kafka.namespace. Needs the prometheus-operator CRDs.
+  metrics:
+    enabled: true
+    interval: 30s
+    # -- Regexes over metric names exposed by the reporter.
+    allowList:
+      - "kafka_server_brokertopicmetrics_.*"
+      - "kafka_server_replicamanager_.*"
+      - "kafka_server_kafkarequesthandlerpool_.*"
+      - "kafka_controller_kafkacontroller_.*"
+      - "kafka_network_requestmetrics_totaltimems.*"
+      - "kafka_network_socketserver_networkprocessoravgidlepercent"
+      - "kafka_log_log_size"
+      - "jvm_.*"
+  topics: []
+  # topics:
+  #   - name: order-events
+  #     partitions: 3
+  #     replicas: 1
+  #     config:
+  #       retention.ms: "604800000"
+
+# -- Grafana for the ShopFlow team, run by the Grafana operator (`grafana-operator` below):
+# -- the instance, a ShopFlow folder (<name>-shopflow) and datasources for Prometheus,
+# -- Alertmanager and Kafka. Dashboards are GrafanaDashboard CRs in deploy/dashboards/, which
+# -- select this instance by `instanceLabels` and the folder by name.
+grafana:
+  enabled: true
+  name: grafana
+  version: "13.3.1"
+  # -- Matched by this chart's datasources and by the dashboards in deploy/dashboards/.
+  instanceLabels:
+    grafana: shopflow
+  # -- External URL; must match the gateway route below.
+  rootUrl: http://localhost:30080/grafana/
+  # -- No login for people (local development): anonymous users get the Admin role and the
+  # -- login form is hidden. The operator still authenticates with the generated admin Secret.
+  anonymousAdmin: true
+  route:
+    enabled: true
+    prefix: /grafana
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: "1"
+      memory: 384Mi
+  datasources:
+    prometheus:
+      url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+      scrapeInterval: 15s
+    alertmanager:
+      url: http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093
+    # -- Browse/stream topic messages (bootstrap derived from `kafka`).
+    kafka:
+      enabled: true
+      plugin:
+        name: hamedkarbasi93-kafka-datasource
+        version: "1.10.0"
+  # -- How often the operator re-pushes the datasources and the folder. Grafana's database
+  # -- is ephemeral (the CRs are the source of truth), so this is also how fast a restarted
+  # -- pod (e.g. after a plugin install) gets its content back.
+  resyncPeriod: 1m
+  dashboards:
+    folder: ShopFlow
+
+# -- Istio authorization in `namespace` (templates/mesh/authorization.yaml): a default deny for
+# -- the whole namespace, and allow rules for PostgreSQL, Kafka UI and Grafana. The service
+# -- charts ship their own AuthorizationPolicy. Callers are matched by mTLS identity.
+mesh:
+  authorization:
+    enabled: true
+    ingressGatewayPrincipal: cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+    grafanaOperatorPrincipal: cluster.local/ns/monitoring/sa/grafana-operator
+    # -- Service accounts allowed to reach PostgreSQL (the service charts' release names).
+    databaseClients:
+      - order-service
+      - payment-service
+      - inventory-service
+
+# -- Shared Istio Gateway on the ingress gateway pods (installed by `task cluster:istio`).
+# -- Service charts reference it as shopflow/<name>.
+gateway:
+  enabled: true
+  name: shopflow-gateway
+  selector:
+    istio: ingressgateway
+  hosts:
+    - "*"
+
+# -- Kafka UI (kafbat), from this chart's templates/kafka-ui rather than the kafbat subchart,
+# -- which can only deploy into the release namespace. Served under `contextPath`, so the
+# -- gateway routes /kafka/* to it without rewriting the UI's asset paths.
+kafkaUi:
+  enabled: true
+  # -- Service name, used by the gateway route.
+  name: kafka-ui
+  image:
+    repository: ghcr.io/kafbat/kafka-ui
+    tag: v1.5.0
+    digest: "sha256:7cda86a33344160309fdb65146332e4da65db81a945614f2fe32e210803f6fd1"
+    pullPolicy: IfNotPresent
+  contextPath: /kafka
+  # -- The image's `kafkaui` user has no fixed numeric UID; runAsNonRoot needs one.
+  uid: 1000
+  gid: 2000
+  javaOpts: "-XX:MaxRAMPercentage=70.0"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 384Mi
+    limits:
+      cpu: "1"
+      memory: 384Mi
+  # -- Merged into the generated application config (clusters come from `kafka`).
+  extraConfig:
+    auth:
+      type: disabled
+    management:
+      health:
+        ldap:
+          enabled: false
+
+# ── Operator subcharts ──────────────────────────────────────────────────────────────────
+
+# -- Prometheus Operator, Prometheus, Alertmanager and the stack Grafana, in `monitoring`.
+# -- Names are pinned to `kube-prometheus-stack-*` (instead of release-derived ones) because
+# -- the datasources, dashboards and service charts address these Services and Secrets.
+kube-prometheus-stack:
+  enabled: true
+  fullnameOverride: kube-prometheus-stack
+  namespaceOverride: monitoring
+
+  # No admission webhooks: their certs are made by pre-install hook Jobs, and hooks run before
+  # any regular resource, including this chart's Namespaces, so the hook can't find
+  # `monitoring` on a fresh cluster. Trade-off: a malformed PrometheusRule is no longer
+  # rejected at apply time; the operator still refuses to load it (and logs why).
+  # The operator's TLS uses the same hook-made Secret, so it goes too (in-cluster only).
+  prometheusOperator:
+    admissionWebhooks:
+      enabled: false
+    tls:
+      enabled: false
+
+  # kind binds these control-plane components to localhost; scraping them only produces
+  # permanently firing TargetDown alerts.
+  kubeEtcd:
+    enabled: false
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeProxy:
+    enabled: false
+
+  prometheus:
+    prometheusSpec:
+      # Pick up ServiceMonitor/PodMonitor/PrometheusRule objects from any release
+      # (the service charts), not only ones labelled with this release's name.
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      retention: 1d
+      resources:
+        requests:
+          cpu: 100m
+          memory: 512Mi
+
+    # -- Istio data plane: every injected sidecar and the ingress gateway. Istio "metrics
+    # -- merging" serves Envoy stats *and* the app's own /metrics (declared through the pod's
+    # -- prometheus.io/* annotations) on the agent's :15020/stats/prometheus, so this one
+    # -- scrape covers both, and works under STRICT mTLS. Based on Istio's reference
+    # -- PodMonitor for prometheus-operator.
+    additionalPodMonitors:
+      envoy-stats:
+        jobLabel: envoy-stats
+        namespaceSelector:
+          any: true
+        selector:
+          matchExpressions:
+            - key: istio-prometheus-ignore
+              operator: DoesNotExist
+        podMetricsEndpoints:
+          - port: http-envoy-prom
+            path: /stats/prometheus
+            interval: 15s
+            relabelings:
+              - action: keep
+                sourceLabels: [__meta_kubernetes_pod_container_name]
+                regex: istio-proxy
+              - action: keep
+                sourceLabels: [__meta_kubernetes_pod_annotationpresent_prometheus_io_scrape]
+              # Scrape the merged endpoint on the port Istio wrote into the annotation.
+              - action: replace
+                sourceLabels: [__meta_kubernetes_pod_annotation_prometheus_io_port, __meta_kubernetes_pod_ip]
+                regex: (\d+);(([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4})
+                replacement: "[$2]:$1"
+                targetLabel: __address__
+              - action: replace
+                sourceLabels: [__meta_kubernetes_pod_annotation_prometheus_io_port, __meta_kubernetes_pod_ip]
+                regex: (\d+);((([0-9]+?)(\.|$)){4})
+                replacement: "$2:$1"
+                targetLabel: __address__
+              # `app` = app.kubernetes.io/name: the label the service charts' PrometheusRules
+              # select app metrics by (Istio metrics carry their own *_workload labels).
+              - action: replace
+                sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+                targetLabel: app
+
+    # -- Istio control plane (xDS pushes, config convergence, injection).
+    additionalServiceMonitors:
+      istiod:
+        jobLabel: istio
+        namespaceSelector:
+          matchNames: [istio-system]
+        selector:
+          matchLabels:
+            istio: pilot
+        endpoints:
+          - port: http-monitoring
+            interval: 15s
+
+  alertmanager:
+    alertmanagerSpec:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+
+  # No adminPassword here: the grafana subchart generates one into the
+  # `kube-prometheus-stack-grafana` Secret (key: admin-password).
+  grafana:
+    namespaceOverride: monitoring
+    fullnameOverride: kube-prometheus-stack-grafana
+    # Local development: anonymous Admin, no login form. The admin user/Secret stays, since
+    # the Grafana operator (stackGrafana) authenticates with it.
+    grafana.ini:
+      auth:
+        disable_login_form: true
+      auth.anonymous:
+        enabled: true
+        org_name: Main Org.
+        org_role: Admin
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+    sidecar:
+      dashboards:
+        # Load ConfigMaps labelled grafana_dashboard=1 from every namespace.
+        searchNamespace: ALL
+
+  kube-state-metrics:
+    namespaceOverride: monitoring
+    fullnameOverride: kube-prometheus-stack-kube-state-metrics
+
+  prometheus-node-exporter:
+    namespaceOverride: monitoring
+    fullnameOverride: kube-prometheus-stack-prometheus-node-exporter
+
+# -- Grafana operator, in `monitoring`, watching every namespace (dashboards are CRs in
+# -- shopflow, the stack Grafana registration is in monitoring).
+grafana-operator:
+  enabled: true
+  fullnameOverride: grafana-operator
+  namespaceOverride: monitoring
+  namespaceScope: false
+  # In the mesh although `monitoring` isn't (pod-level opt-in): the operator calls the ShopFlow
+  # Grafana API in `shopflow`, which needs mTLS once that namespace is STRICT, and the sidecar
+  # gives it an identity (cluster.local/ns/monitoring/sa/grafana-operator) that authorization
+  # policies can name. Its other traffic (API server, the stack Grafana) passes through.
+  podLabels:
+    sidecar.istio.io/inject: "true"
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+# -- Registers the kube-prometheus-stack Grafana with the operator as an *external* instance,
+# -- so cluster-level dashboards can also ship as CRs (selector below). The ShopFlow
+# -- dashboards target the `grafana` instance in `namespace` instead.
+stackGrafana:
+  enabled: true
+  name: grafana
+  namespace: monitoring
+  labels:
+    dashboards: grafana
+  url: http://kube-prometheus-stack-grafana.monitoring.svc.cluster.local:80
+  adminSecret:
+    name: kube-prometheus-stack-grafana
+    userKey: admin-user
+    passwordKey: admin-password
+
+# -- Resource metrics API for HorizontalPodAutoscalers (the service charts' `autoscaling`) and
+# -- `kubectl top`. kind ships no metrics-server (minikube had it as an addon).
+metrics-server:
+  enabled: true
+  fullnameOverride: metrics-server
+  namespaceOverride: kube-system
+  args:
+    # kind's kubelet serving certs are self-signed and don't carry the node IP as a SAN.
+    - --kubelet-insecure-tls
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# -- Strimzi cluster operator, in the release namespace (kafka-system). Watches
+# -- kafka.namespace in addition to its own.
+strimzi-kafka-operator:
+  enabled: true
+  watchNamespaces:
+    - shopflow
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 384Mi

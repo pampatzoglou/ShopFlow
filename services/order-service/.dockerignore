@@ -1,0 +1,29 @@
+# Build context: this directory. Patterns match from the context root only; **/ makes them
+# match at any depth (git's .gitignore does that implicitly, .dockerignore does not).
+
+# VCS and ignore files, at any depth
+.git
+**/.gitignore
+.dockerignore
+Dockerfile
+
+# Editor / OS
+**/.DS_Store
+.idea
+.vscode
+**/*.swp
+
+# Local secrets
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+
+# Gradle output and local caches — the build stage regenerates these
+build
+.gradle
+.kotlin
+**/*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+*.md

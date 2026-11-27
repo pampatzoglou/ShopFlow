@@ -1,0 +1,89 @@
+{{- if .Values.kafkaUi.enabled }}
+{{- $ui := .Values.kafkaUi -}}
+{{- $ctx := dict "root" . "name" "kafka-ui" "component" "ui" -}}
+{{- $health := printf "%s/actuator/health" ($ui.contextPath | trimSuffix "/") -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $ui.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "shopflow-infra.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/kafka-ui/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "shopflow-infra.labels" $ctx | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $ui.name }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ $ui.uid }}
+        runAsGroup: {{ $ui.gid }}
+        fsGroup: {{ $ui.gid }}
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka-ui
+          {{- with $ui.image }}
+          image: {{ if .digest }}{{ printf "%s:%s@%s" .repository .tag .digest }}{{ else }}{{ printf "%s:%s" .repository .tag }}{{ end }}
+          imagePullPolicy: {{ .pullPolicy }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: SPRING_CONFIG_ADDITIONAL-LOCATION
+              value: /etc/kafka-ui/config.yml
+            - name: SERVER_SERVLET_CONTEXT_PATH
+              value: {{ $ui.contextPath | quote }}
+            - name: JAVA_OPTS
+              value: {{ $ui.javaOpts | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: {{ $health }}
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: {{ $health }}
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: {{ $health }}
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+          resources:
+            {{- toYaml $ui.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kafka-ui
+              readOnly: true
+            # The JVM and Spring Boot's embedded Tomcat need a writable temp dir.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $ui.name }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

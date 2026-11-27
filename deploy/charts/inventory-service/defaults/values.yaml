@@ -1,0 +1,172 @@
+# -- Operational baseline applied to every cluster deployment, layered over values.yaml.
+
+podAnnotations:
+  reloader.stakater.com/auto: "true"
+
+# -- The image's USER is a named system account with no fixed UID, so pin a numeric UID
+# -- here; runAsNonRoot cannot verify a non-numeric user.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+
+# -- Writable scratch space under readOnlyRootFilesystem.
+volumes:
+  - name: tmp
+    emptyDir: {}
+
+volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+
+virtualService:
+  enabled: true
+  gateways:
+    - shopflow/shopflow-gateway
+
+# -- Every cluster runs kube-prometheus-stack (CRDs present) and the Istio mesh: merge app
+# -- metrics into the sidecar scrape and ship the alert rules.
+metrics:
+  enabled: true
+  prometheusRule:
+    enabled: true
+
+# -- Allow-list for every cluster (Istio sidecar mode; kube-prometheus-stack in `monitoring`).
+# -- Ports are pod ports: NetworkPolicy sees traffic after Service translation, and the sidecar
+# -- redirect happens inside the pod, after the policy check.
+networkPolicy:
+  enabled: true
+  ingress:
+    # External API traffic, through the Istio ingress gateway.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              istio: ingressgateway
+      ports:
+        - port: http
+    # reservations from order-service; connectivity checks from payment-service.
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - order-service
+                  - payment-service
+      ports:
+        - port: http
+    # Prometheus: the sidecar's merged app + Envoy metrics (:15020, the envoy-stats
+    # PodMonitor) and the app's metrics port (direct PodMonitor, off-mesh clusters).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: 15020
+        - port: metrics
+  egress:
+    # DNS first, or every other egress rule silently fails name resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Sidecar: config and certificates from istiod.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              app: istiod
+      ports:
+        - port: 15012
+    # PostgreSQL (shopflow-infra) in this namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - port: 5432
+    # Peer services: connectivity checks (/health).
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - order-service
+                  - payment-service
+      ports:
+        - port: 8080
+
+# -- L7 allow-list (the NetworkPolicy above is the L3/L4 one). Callers by mTLS identity.
+authorizationPolicy:
+  enabled: true
+  rules:
+    # Public API: everything that arrives through the Istio ingress gateway.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+    # order-service: product lookup, reserve and release stock (InventoryClient), and its connectivity check.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/{{ .Release.Namespace }}/sa/order-service
+      to:
+        - operation:
+            methods: [GET]
+            paths: ["/api/inventory/products/{*}"]
+        - operation:
+            methods: [POST]
+            paths: ["/api/inventory/reserve"]
+        - operation:
+            methods: [DELETE]
+            paths: ["/api/inventory/reservations/{*}"]
+        - operation:
+            methods: [GET]
+            paths: ["/health"]
+    # Connectivity check from payment-service.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/{{ .Release.Namespace }}/sa/payment-service
+      to:
+        - operation:
+            methods: [GET]
+            paths: ["/health"]

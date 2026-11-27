@@ -1,0 +1,23 @@
+# Repo-wide ignores. Per-service build output lives in services/*/.gitignore.
+# Self-contained on purpose: the devcontainer has no global gitignore (its home directory is
+# not the host's), so nothing here may rely on one.
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Tool state and generated output
+.devbox/
+.argo/
+deploy/**/charts/*/charts/*.tgz
+
+# Python caches and virtualenvs (e2e/.venv from `task test`, ruff, pytest)
+__pycache__/
+.venv/
+.ruff_cache/
+.pytest_cache/
+
+# kind kubeconfig export for host-side tools (`task cluster:kubeconfig`): admin credentials
+.kube/

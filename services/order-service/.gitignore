@@ -1,0 +1,21 @@
+# Local-only files for this service. What the image build excludes is .dockerignore's job.
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Gradle / Kotlin output and caches
+build/
+.gradle/
+.kotlin/
+*.jar
+# The wrapper jar is source: ./gradlew and the Dockerfile need it.
+!gradle/wrapper/gradle-wrapper.jar

@@ -1,0 +1,21 @@
+{{- if .Values.gateway.enabled }}
+# Shared HTTP entry point on the Istio ingress gateway; the service charts and the Kafka UI
+# attach VirtualServices to it as <release namespace>/{{ .Values.gateway.name }}.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "gateway" "component" "ingress") | nindent 4 }}
+spec:
+  selector:
+    {{- toYaml .Values.gateway.selector | nindent 4 }}
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        {{- toYaml .Values.gateway.hosts | nindent 8 }}
+{{- end }}

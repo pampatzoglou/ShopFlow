@@ -1,0 +1,55 @@
+# Dependabot has no devbox ecosystem (its `nix` ecosystem only reads flake.lock), so this
+# job does the equivalent for devbox.lock: weekly `devbox update`, opened as a PR.
+#
+# `devbox update` stays inside the major.minor constraints in devbox.json, so it only moves
+# patch versions; the pins in .github/actions/setup-tools still satisfy those constraints
+# and `task ci:versions` keeps passing. Minor/major bumps stay a deliberate edit of
+# devbox.json + setup-tools together.
+#
+# PRs opened with GITHUB_TOKEN do not trigger other workflows: close and reopen the PR (or
+# push to its branch) to run CI on it.
+name: devbox update
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC, alongside Dependabot's weekly run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update devbox.lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write        # push the update branch
+      pull-requests: write   # open/refresh the PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The one place devbox runs in CI: this job's whole purpose is to re-resolve its lockfile.
+      - uses: jetify-com/devbox-install-action@05e954310554b6122a26b4880d69937f61b1eb2e # v0.16.0
+        with:
+          devbox-version: 0.18.4
+          enable-cache: "true"
+      - run: devbox update
+      - uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          branch: chore/devbox-update
+          delete-branch: true
+          commit-message: "chore(deps): update devbox.lock"
+          title: "chore(deps): update devbox.lock"
+          body: |
+            Weekly `devbox update` — patch updates within the constraints in `devbox.json`.
+
+            CI does not run automatically on PRs opened by this workflow: close and reopen
+            the PR to trigger it.
+          labels: dependencies
+          add-paths: devbox.lock

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: payment-service
+description: ShopFlow payment service — charges and refunds orders.
+type: application
+version: 0.6.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+maintainers:
+  - name: shopflow-platform

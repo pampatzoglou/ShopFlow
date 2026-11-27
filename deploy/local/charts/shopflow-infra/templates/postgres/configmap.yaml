@@ -1,0 +1,14 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.postgres.serviceName }}-init
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" . "name" "postgres" "component" "database") | nindent 4 }}
+data:
+  init-databases.sql: |
+    {{- range .Values.postgres.databases }}
+    CREATE DATABASE {{ . | quote }};
+    {{- end }}
+{{- end }}

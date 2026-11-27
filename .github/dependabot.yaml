@@ -1,0 +1,163 @@
+# Dependency updates for every ecosystem in the repo.
+# Policy:
+#   - Weekly, one grouped PR per ecosystem for minor/patch; majors arrive as separate PRs.
+#   - 3-day cooldown on new releases, longer for majors: avoids pulling a freshly published
+#     (possibly compromised or yanked) version on day zero.
+#   - Conventional Commit titles: chore(deps) / chore(deps-dev) / ci(deps).
+# devbox.lock: Dependabot has no devbox ecosystem (its `nix` ecosystem only reads flake.lock),
+# so .github/workflows/devbox-update.yaml runs `devbox update` weekly and opens a PR.
+# Not covered at all (bump deliberately): minor/major devbox.json constraints together with
+# .github/actions/setup-tools (`task ci:versions` enforces the pairing), the kind node
+# image in deploy/local/kind/cluster.yaml, and Istio itself (installed by the devbox-pinned
+# istioctl from deploy/local/istio/istio.yaml, so its version is istioctl@ in devbox.json).
+version: 2
+
+updates:
+  # ── Application dependencies ──────────────────────────────────────────────────────────
+
+  - package-ecosystem: npm
+    directory: /services/payment-service
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+    commit-message:
+      prefix: chore
+      prefix-development: chore
+      include: scope
+    groups:
+      npm-production:
+        dependency-type: production
+        update-types: [minor, patch]
+      npm-development:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  - package-ecosystem: gradle
+    directory: /services/order-service
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # Kotlin plugins (jvm, plugin.spring) must share one version.
+      kotlin:
+        patterns: ["org.jetbrains.kotlin*"]
+      spring:
+        patterns: ["org.springframework*", "io.spring*"]
+        update-types: [minor, patch]
+      gradle-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directories:
+      - /services/inventory-service
+      - /e2e
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      pip-minor-patch:
+        update-types: [minor, patch]
+
+  # ── Container images ──────────────────────────────────────────────────────────────────
+  # Dockerfile base images (tag + digest), and image references in the local charts and
+  # manifests.
+
+  - package-ecosystem: docker
+    directories:
+      - /services/*
+      - /deploy/local/charts/shopflow-infra
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      # A PostgreSQL major needs a dump/restore of the data volume — upgrade by hand.
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+    groups:
+      docker:
+        patterns: ["*"]
+
+  # ── Dev container Features ────────────────────────────────────────────────────────────
+  # Feature versions in .devcontainer/devcontainer.json. Majors come as separate PRs: test
+  # `task cluster:up` inside the container before merging one. The image itself
+  # (ghcr.io/pampatzoglou/devcontainer) is bumped by hand.
+
+  - package-ecosystem: devcontainers
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # ── Helm chart dependencies (local umbrella charts) ───────────────────────────────────
+
+  - package-ecosystem: helm
+    directories:
+      - /deploy/local/charts/*
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      helm-minor-patch:
+        update-types: [minor, patch]
+
+  # ── Git hooks ─────────────────────────────────────────────────────────────────────────
+  # Bumps each hook's `rev:` in /.pre-commit-config.yaml.
+
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      # Runs the devbox-pinned binary; bump with hadolint@ in devbox.json.
+      - dependency-name: hadolint/hadolint
+    groups:
+      pre-commit:
+        patterns: ["*"]
+
+  # ── CI ────────────────────────────────────────────────────────────────────────────────
+
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      github-actions:
+        patterns: ["*"]

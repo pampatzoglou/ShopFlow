@@ -1,0 +1,28 @@
+{{- /* Direct scrape of the metrics port, for clusters without the Istio sidecar. In the
+       mesh, metrics are merged into the sidecar scrape instead (see values: metrics). */ -}}
+{{- if and .Values.metrics.enabled .Values.metrics.podMonitor.enabled }}
+{{- $component := dict "root" . "component" "server" }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "inventory-service.fullname" . }}
+  labels:
+    {{- include "inventory-service.componentLabels" $component | nindent 4 }}
+    {{- with .Values.metrics.podMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "inventory-service.componentSelectorLabels" $component | nindent 6 }}
+  podMetricsEndpoints:
+    - port: metrics
+      path: {{ .Values.metrics.path }}
+      interval: {{ .Values.metrics.podMonitor.interval }}
+      relabelings:
+        # Same `app` label the mesh-wide envoy-stats PodMonitor sets, so the
+        # PrometheusRule selectors work either way.
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          targetLabel: app
+{{- end }}

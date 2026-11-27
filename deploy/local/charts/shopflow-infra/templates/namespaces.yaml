@@ -1,0 +1,24 @@
+{{- /*
+Namespaces this release installs into, other than its own (kafka-system, created by
+`helm install --create-namespace`). Helm creates Namespaces before every other kind, which the
+Strimzi subchart relies on: it creates RoleBindings in the namespaces it watches.
+
+`keep`: uninstalling this release must not delete a namespace, which would also take down
+everything else in it (the service charts live in shopflow).
+*/ -}}
+{{- range $name, $ns := .Values.namespaces }}
+{{- if ne $name $.Release.Namespace }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $name }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "shopflow-infra.labels" (dict "root" $ "name" "namespace" "component" "platform") | nindent 4 }}
+    {{- with $ns.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- end }}

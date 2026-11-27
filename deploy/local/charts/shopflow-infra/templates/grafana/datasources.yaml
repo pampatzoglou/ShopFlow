@@ -1,0 +1,81 @@
+{{- if .Values.grafana.enabled }}
+{{- $g := .Values.grafana -}}
+{{- $ds := $g.datasources -}}
+{{- $labels := include "shopflow-infra.labels" (dict "root" . "name" "grafana" "component" "datasource") -}}
+# Fixed UIDs: dashboards reference datasources by uid, so they survive a re-create.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: {{ $g.name }}-prometheus
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  resyncPeriod: {{ $g.resyncPeriod }}
+  instanceSelector:
+    matchLabels:
+      {{- toYaml $g.instanceLabels | nindent 6 }}
+  datasource:
+    name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: {{ $ds.prometheus.url }}
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: {{ $ds.prometheus.scrapeInterval }}
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: {{ $g.name }}-alertmanager
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  resyncPeriod: {{ $g.resyncPeriod }}
+  instanceSelector:
+    matchLabels:
+      {{- toYaml $g.instanceLabels | nindent 6 }}
+  datasource:
+    name: Alertmanager
+    uid: alertmanager
+    type: alertmanager
+    access: proxy
+    url: {{ $ds.alertmanager.url }}
+    editable: false
+    jsonData:
+      implementation: prometheus
+      # Grafana-managed alerts stay in Grafana; the PrometheusRules route via Prometheus.
+      handleGrafanaManagedAlerts: false
+{{- if $ds.kafka.enabled }}
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: {{ $g.name }}-kafka
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  resyncPeriod: {{ $g.resyncPeriod }}
+  instanceSelector:
+    matchLabels:
+      {{- toYaml $g.instanceLabels | nindent 6 }}
+  # Community plugin; the operator installs it into the Grafana pod.
+  plugins:
+    - name: {{ $ds.kafka.plugin.name }}
+      version: {{ $ds.kafka.plugin.version | quote }}
+  datasource:
+    name: Kafka
+    uid: kafka
+    type: {{ $ds.kafka.plugin.name }}
+    access: proxy
+    editable: false
+    jsonData:
+      bootstrapServers: {{ printf "%s-kafka-bootstrap.%s.svc.cluster.local:9092" .Values.kafka.name .Values.kafka.namespace | quote }}
+      securityProtocol: PLAINTEXT
+{{- end }}
+{{- end }}

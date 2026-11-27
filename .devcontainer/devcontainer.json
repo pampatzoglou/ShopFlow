@@ -1,0 +1,75 @@
+{
+  // Same toolchain as `devbox shell`. The image (github.com/pampatzoglou/devcontainer, built
+  // from that repo's commit in the tag) carries most devbox tools, hash-pinned. The features
+  // below add the ones it doesn't. `task ci:versions` checks both against devbox.lock.
+  // remoteUser, remoteEnv (no host SSH agent / git credential helper, core.fileMode=false),
+  // the OIDC callback portsAttributes and postCreateCommand (pre-commit install) are inherited
+  // from the image's devcontainer.metadata label; override them here if needed.
+  // Bump: new tag + digest (`docker buildx imagetools inspect <image>:<tag>`); Dependabot
+  // bumps only the features.
+  "name": "shopflow",
+  "image": "ghcr.io/pampatzoglou/devcontainer:3f27bb1@sha256:37cf24ad41959d91296dcdb19f6cd6a66b2d3a511ff754e02ddda3b362d1b24f",
+
+  // Exact feature versions; the `// devbox.json:` lines are checked by `task ci:versions`.
+  // Features fetch at container build time with their own verification, not hash pins.
+  "features": {
+    // kind needs a daemon; DinD keeps kind's API server on the container's loopback. This
+    // makes the container --privileged: anything in it is effectively root on the Docker VM.
+    // 2.17.0 is the last 2.x; majors 3 and 4 need a kind test before moving.
+    "ghcr.io/devcontainers/features/docker-in-docker:2.17.0": {},
+    // SDKMAN keeps only the newest Temurin per major, so only the major can be pinned.
+    "ghcr.io/devcontainers/features/java:1.8.3": {
+      "version": "21", // devbox.json: temurin-bin-21@21.0 (major)
+      "jdkDistro": "tem",
+    },
+    "ghcr.io/devcontainers/features/node:2.1.2": {
+      "version": "22.23.5", // devbox.json: nodejs@22
+    },
+    // No official feature; installs the GitHub release asset (no checksum verification).
+    "ghcr.io/devcontainers-extra/features/gh-release:1.0.26": {
+      "repo": "kubescape/kubescape",
+      "binaryNames": "kubescape",
+      "version": "4.0.20", // devbox.json: kubescape@4.0
+      "assetRegex": "^kubescape_.*\\.tar\\.gz$",
+    },
+  },
+
+  // Claude Code state (login included) survives rebuilds; mounts can't come from the image.
+  "mounts": [
+    "source=claude-code-config-${devcontainerId},target=/home/vscode/.claude,type=volume",
+  ],
+
+  // Everything the kind cluster serves on the container's loopback, forwarded to the same port
+  // on the host through VS Code's tunnel (which can reach container loopback; docker -p can't).
+  // requireLocalPort: fail visibly rather than move to another port, since the kubeconfig and
+  // URLs name these. A port taken on the host (e.g. a host-side kind cluster on 30080) shows
+  // an error in the Ports view; stop the other one. Forwards exist only while VS Code is attached.
+  //   6444         kind API server: OpenLens etc. with .kube/kind-shopflow.yaml
+  //   30080/30443  Istio ingress gateway: Grafana, Kafka UI, service APIs (task cluster:up)
+  //   8081-8083    skaffold dev port-forwards, one per service (skaffold.yaml; while it runs)
+  // Merged per port with the image's portsAttributes (OIDC callbacks).
+  "forwardPorts": [6444, 30080, 30443, 8081, 8082, 8083],
+  "portsAttributes": {
+    "6444": { "label": "kind API server", "requireLocalPort": true, "onAutoForward": "silent" },
+    "30080": { "label": "gateway (http)", "requireLocalPort": true, "onAutoForward": "silent" },
+    "30443": { "label": "gateway (https)", "requireLocalPort": true, "onAutoForward": "silent" },
+    "8081": { "label": "order-service", "requireLocalPort": true, "onAutoForward": "silent" },
+    "8082": { "label": "payment-service", "requireLocalPort": true, "onAutoForward": "silent" },
+    "8083": { "label": "inventory-service", "requireLocalPort": true, "onAutoForward": "silent" },
+  },
+
+  // Merged with the image's extensions (Claude Code, direnv). The Taskfile extension lists and
+  // runs Taskfile.yaml tasks from the sidebar, using the image's `task` binary.
+  "customizations": {
+    "vscode": {
+      "extensions": ["task.vscode-task"],
+    },
+  },
+
+  // Zed implements forwardPorts as `docker run -p`, which can't reach the container's loopback
+  // (where kind and skaffold listen) and fails if the host already holds a port: the forwards
+  // above are VS Code only. `task test` inside the container needs none.
+  // Zed also can't forward the OIDC callbacks; use device-code logins there:
+  //   kubectl oidc-login: add `--grant-type=device-code` to the kubeconfig exec args
+  //   aws sso login --use-device-code
+}

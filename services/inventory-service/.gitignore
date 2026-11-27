@@ -1,0 +1,23 @@
+# Local-only files for this service. What the image build excludes is .dockerignore's job.
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Python caches, virtualenvs, test and lint output
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

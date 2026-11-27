@@ -1,0 +1,33 @@
+# Build context: this directory. Patterns match from the context root only; **/ makes them
+# match at any depth (git's .gitignore does that implicitly, .dockerignore does not).
+
+# VCS and ignore files, at any depth (caches like .pytest_cache/ carry their own .gitignore)
+.git
+**/.gitignore
+.dockerignore
+Dockerfile
+
+# Editor / OS
+**/.DS_Store
+.idea
+.vscode
+**/*.swp
+
+# Local secrets
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+
+# Generated / local-only
+**/__pycache__
+**/*.pyc
+.venv
+venv
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+tests
+
+*.md

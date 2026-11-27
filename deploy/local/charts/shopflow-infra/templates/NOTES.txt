@@ -1,0 +1,23 @@
+ShopFlow infrastructure installed (release {{ .Release.Name }} in {{ .Release.Namespace }}).
+{{- if (index .Values "kube-prometheus-stack").enabled }}
+
+Monitoring:  kube-prometheus-stack + Grafana operator in {{ (index .Values "kube-prometheus-stack").namespaceOverride }}
+{{- end }}
+{{- if .Values.postgres.enabled }}
+
+PostgreSQL:  {{ .Values.postgres.serviceName }}.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.postgres.port }}
+             databases: {{ join ", " .Values.postgres.databases }}
+{{- end }}
+{{- if .Values.kafka.enabled }}
+
+Kafka:       {{ .Values.kafka.name }}-kafka-bootstrap.{{ .Values.kafka.namespace }}.svc.cluster.local:9092
+             kubectl -n {{ .Values.kafka.namespace }} wait kafka/{{ .Values.kafka.name }} --for=condition=Ready --timeout=600s
+{{- end }}
+{{- if and .Values.gateway.enabled .Values.kafkaUi.enabled }}
+
+Kafka UI:    http://localhost:30080{{ .Values.kafkaUi.contextPath }}
+{{- end }}
+{{- if and .Values.gateway.enabled .Values.grafana.enabled .Values.grafana.route.enabled }}
+
+Grafana:     {{ .Values.grafana.rootUrl }}{{ if .Values.grafana.anonymousAdmin }}   (no login){{ end }}
+{{- end }}
